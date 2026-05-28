@@ -1,0 +1,7 @@
+discord.py>=2.3.2
+gspread
+oauth2client
+aiohttp
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
