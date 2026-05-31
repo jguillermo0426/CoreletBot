@@ -32,6 +32,8 @@ def initialize_db():
         assigned_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         due_date TIMESTAMP,
         forum_thread_id INTEGER,          -- To track where the task is discussed
+        min_level INTEGER,
+        reference_image_url TEXT,
         FOREIGN KEY (user_id) REFERENCES users (user_id)
     )
     """)

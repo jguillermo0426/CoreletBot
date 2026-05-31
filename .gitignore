@@ -4,3 +4,4 @@ oauth_credentials.json
 data/google_token.json
 __pycache__/
 *.pyc
+.venv

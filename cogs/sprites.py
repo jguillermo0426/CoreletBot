@@ -10,8 +10,90 @@ from googleapiclient.http import MediaIoBaseUpload
 import io
 import base64
 import aiohttp
+from gspread.exceptions import WorksheetNotFound
 from google_auth import get_google_credentials
-from task_forum import update_task_forum_status
+from task_forum import update_task_forum_status, update_task_forum_summary
+
+COMPLETED_TASK_SHEETS = {
+    "pokemon": "Completed Pokemon Tasks",
+    "character": "Completed Character Tasks",
+    "music": "Completed Sound Tasks",
+}
+
+COMPLETED_TASK_HEADER = ["Task", "Variant", "Type", "File", "Artist"]
+CHARACTER_COMPLETED_HEADER = [
+    "Character Name",
+    "Character Design",
+    "Design Artist",
+    "Battler",
+    "Battler Artist",
+    "Overworld",
+    "Overworld Artist",
+]
+POKEMON_COMPLETED_HEADER = [
+    "Dex Number",
+    "Pokemon Name",
+    "Front Sprite",
+    "Frame 2",
+    "Back Sprite",
+    "Front Sprite Artist",
+    "Front 2 Artist",
+    "Back Artist",
+    "Icons",
+    "Icon Artist",
+    "Shiny Front",
+    "Shiny Front 2",
+    "Shiny Back",
+    "Anomaly Front",
+    "Anomaly Front 2",
+    "Anomaly Back",
+    "Anomaly Author",
+    "Ref",
+]
+POKEMON_FILE_COLUMNS = {
+    ("Base", "Front"): 2,
+    ("Base", "Front 2"): 3,
+    ("Base", "Back"): 4,
+    ("Base", "Icon"): 8,
+    ("Shiny", "Front"): 10,
+    ("Shiny", "Front 2"): 11,
+    ("Shiny", "Back"): 12,
+    ("Anomaly", "Front"): 13,
+    ("Anomaly", "Front 2"): 14,
+    ("Anomaly", "Back"): 15,
+}
+POKEMON_ARTIST_COLUMNS = {
+    ("Base", "Front"): 5,
+    ("Base", "Front 2"): 6,
+    ("Base", "Back"): 7,
+    ("Base", "Icon"): 9,
+    ("Anomaly", "Front"): 16,
+    ("Anomaly", "Front 2"): 16,
+    ("Anomaly", "Back"): 16,
+}
+CHARACTER_FILE_COLUMNS = {
+    "Design": 1,
+    "Battler": 3,
+    "Overworld": 5,
+}
+CHARACTER_ARTIST_COLUMNS = {
+    "Design": 2,
+    "Battler": 4,
+    "Overworld": 6,
+}
+
+
+def split_pokemon_identifier(identifier: str):
+    identifier = str(identifier)
+    if " - " not in identifier:
+        return "", identifier.strip()
+
+    dex_number, pokemon_name = identifier.split(" - ", 1)
+    return dex_number.strip(), pokemon_name.strip()
+
+
+def sheet_text(value):
+    return "" if value is None else str(value).strip()
 
 
 async def update_task_bundle_forum_status(bot, db_path: str, thread_id, message=None):
@@ -24,7 +106,7 @@ async def update_task_bundle_forum_status(bot, db_path: str, thread_id, message=
             SELECT status
             FROM tasks
             WHERE forum_thread_id = ?
-              AND status IN ('Available', 'Unassigned', 'Assigned', 'Waiting For Feedback', 'Completed')
+              AND status IN ('Available', 'Unassigned', 'Assigned', 'Waiting For Feedback', 'Completed', 'Removed')
         """, (thread_id,))
         statuses = [row[0] for row in cursor.fetchall()]
 
@@ -37,10 +119,13 @@ async def update_task_bundle_forum_status(bot, db_path: str, thread_id, message=
         aggregate_status = "Assigned"
     elif all(status == "Completed" for status in statuses):
         aggregate_status = "Completed"
+    elif all(status == "Removed" for status in statuses):
+        aggregate_status = "Removed"
     else:
         aggregate_status = "Available"
 
     await update_task_forum_status(bot, thread_id, aggregate_status, message)
+    await update_task_forum_summary(bot, db_path, thread_id)
 
 
 class Sprites(commands.Cog):
@@ -65,8 +150,7 @@ class Sprites(commands.Cog):
             if spreadsheet_id:
                 self.spreadsheet = self.gc.open_by_key(spreadsheet_id)
             else:
-                self.spreadsheet = self.gc.open("Pokemon Void Pokedex Checklist ( MASTER DOCUMENTATION )")
-            self.worksheet = self.spreadsheet.worksheet("Completed Sprites")
+                self.spreadsheet = self.gc.open("Pokemon Void : Profiles, Tasks")
             
             # Initialize the Drive API
             self.drive_service = build('drive', 'v3', credentials=credentials)
@@ -101,12 +185,182 @@ class Sprites(commands.Cog):
             return self.character_drive_folder_id
         return self.pokemon_drive_folder_id
 
-    def get_drive_subfolder_path(self, variant: str, sprite_type: str):
+    def get_drive_task_folder_name(self, identifier: str):
+        task_name = identifier
+        if " - " in task_name:
+            task_name = task_name.split(" - ", 1)[1]
+
+        return task_name.strip().upper().replace("/", "-")
+
+    def get_task_sheet_group(self, variant: str):
+        if variant == "Audio":
+            return "music"
+        if variant == "Character":
+            return "character"
+        return "pokemon"
+
+    def get_or_create_completed_worksheet(self, variant: str):
+        title = COMPLETED_TASK_SHEETS[self.get_task_sheet_group(variant)]
+        sheet_group = self.get_task_sheet_group(variant)
+        if sheet_group == "pokemon":
+            header = POKEMON_COMPLETED_HEADER
+        elif sheet_group == "character":
+            header = CHARACTER_COMPLETED_HEADER
+        else:
+            header = COMPLETED_TASK_HEADER
+        try:
+            worksheet = self.spreadsheet.worksheet(title)
+        except WorksheetNotFound:
+            worksheet = self.spreadsheet.add_worksheet(title=title, rows=100, cols=len(header))
+
+        if not worksheet.get_all_values():
+            worksheet.update(values=[header], range_name="A1")
+
+        return worksheet
+
+    def get_worksheet_values(self, worksheet):
+        try:
+            return worksheet.get_all_values(value_render_option="FORMULA")
+        except TypeError:
+            return worksheet.get_all_values()
+
+    def update_completed_pokemon_sheet(self, worksheet, identifier: str, variant: str, sprite_type: str, file_value: str, artist_name: str):
+        file_column = POKEMON_FILE_COLUMNS.get((variant, sprite_type))
+        if file_column is None:
+            worksheet.append_row([identifier, variant, sprite_type, file_value, artist_name], value_input_option="USER_ENTERED")
+            return
+
+        dex_number, pokemon_name = split_pokemon_identifier(identifier)
+        values = self.get_worksheet_values(worksheet)
+        if not values:
+            values = [POKEMON_COMPLETED_HEADER]
+
+        header = values[0]
+        if header[:len(POKEMON_COMPLETED_HEADER)] != POKEMON_COMPLETED_HEADER:
+            migrated_rows = {}
+            for row in values[1:]:
+                if len(row) < 5:
+                    continue
+
+                old_identifier, old_variant, old_sprite_type, old_file_value, old_artist_name = row[:5]
+                old_dex_number, old_pokemon_name = split_pokemon_identifier(old_identifier)
+                pokemon_key = (old_dex_number, old_pokemon_name)
+                if pokemon_key not in migrated_rows:
+                    migrated_row = [""] * len(POKEMON_COMPLETED_HEADER)
+                    migrated_row[0] = old_dex_number
+                    migrated_row[1] = old_pokemon_name
+                    migrated_rows[pokemon_key] = migrated_row
+
+                migrated_row = migrated_rows[pokemon_key]
+                old_file_column = POKEMON_FILE_COLUMNS.get((old_variant, old_sprite_type))
+                if old_file_column is not None:
+                    migrated_row[old_file_column] = old_file_value
+
+                old_artist_column = POKEMON_ARTIST_COLUMNS.get((old_variant, old_sprite_type))
+                if old_artist_column is not None:
+                    migrated_row[old_artist_column] = old_artist_name
+
+            worksheet.clear()
+            values = [POKEMON_COMPLETED_HEADER, *migrated_rows.values()]
+            worksheet.update(values=values, range_name="A1", value_input_option="USER_ENTERED")
+
+        row_number = None
+        row_values = None
+        for index, row in enumerate(values[1:], start=2):
+            padded_row = row + [""] * (len(POKEMON_COMPLETED_HEADER) - len(row))
+            if sheet_text(padded_row[0]) == dex_number and sheet_text(padded_row[1]).casefold() == pokemon_name.casefold():
+                row_number = index
+                row_values = padded_row[:len(POKEMON_COMPLETED_HEADER)]
+                break
+
+        if row_values is None:
+            row_number = len(values) + 1
+            row_values = [""] * len(POKEMON_COMPLETED_HEADER)
+            row_values[0] = dex_number
+            row_values[1] = pokemon_name
+
+        row_values[file_column] = file_value
+        artist_column = POKEMON_ARTIST_COLUMNS.get((variant, sprite_type))
+        if artist_column is not None:
+            row_values[artist_column] = artist_name
+
+        worksheet.update(
+            values=[row_values],
+            range_name=f"A{row_number}:R{row_number}",
+            value_input_option="USER_ENTERED",
+        )
+
+    def update_completed_character_sheet(self, worksheet, identifier: str, sprite_type: str, file_value: str, artist_name: str):
+        file_column = CHARACTER_FILE_COLUMNS.get(sprite_type)
+        if file_column is None:
+            worksheet.append_row([identifier, "Character", sprite_type, file_value, artist_name], value_input_option="USER_ENTERED")
+            return
+
+        values = self.get_worksheet_values(worksheet)
+        if not values:
+            values = [CHARACTER_COMPLETED_HEADER]
+
+        header = values[0]
+        if header[:len(CHARACTER_COMPLETED_HEADER)] != CHARACTER_COMPLETED_HEADER:
+            migrated_rows = {}
+            for row in values[1:]:
+                if len(row) < 5:
+                    continue
+
+                old_identifier, old_variant, old_sprite_type, old_file_value, old_artist_name = row[:5]
+                if old_variant != "Character":
+                    continue
+
+                if old_identifier not in migrated_rows:
+                    migrated_row = [""] * len(CHARACTER_COMPLETED_HEADER)
+                    migrated_row[0] = old_identifier
+                    migrated_rows[old_identifier] = migrated_row
+
+                migrated_row = migrated_rows[old_identifier]
+                old_file_column = CHARACTER_FILE_COLUMNS.get(old_sprite_type)
+                if old_file_column is not None:
+                    migrated_row[old_file_column] = old_file_value
+
+                old_artist_column = CHARACTER_ARTIST_COLUMNS.get(old_sprite_type)
+                if old_artist_column is not None:
+                    migrated_row[old_artist_column] = old_artist_name
+
+            worksheet.clear()
+            values = [CHARACTER_COMPLETED_HEADER, *migrated_rows.values()]
+            worksheet.update(values=values, range_name="A1", value_input_option="USER_ENTERED")
+
+        row_number = None
+        row_values = None
+        for index, row in enumerate(values[1:], start=2):
+            padded_row = row + [""] * (len(CHARACTER_COMPLETED_HEADER) - len(row))
+            if sheet_text(padded_row[0]).casefold() == identifier.casefold():
+                row_number = index
+                row_values = padded_row[:len(CHARACTER_COMPLETED_HEADER)]
+                break
+
+        if row_values is None:
+            row_number = len(values) + 1
+            row_values = [""] * len(CHARACTER_COMPLETED_HEADER)
+            row_values[0] = identifier
+
+        row_values[file_column] = file_value
+        artist_column = CHARACTER_ARTIST_COLUMNS.get(sprite_type)
+        if artist_column is not None:
+            row_values[artist_column] = artist_name
+
+        worksheet.update(
+            values=[row_values],
+            range_name=f"A{row_number}:G{row_number}",
+            value_input_option="USER_ENTERED",
+        )
+
+    def get_drive_subfolder_path(self, identifier: str, variant: str, sprite_type: str):
+        task_folder = self.get_drive_task_folder_name(identifier)
         if variant == "Audio":
             return [sprite_type]
         if variant == "Character":
-            return [sprite_type]
-        return [variant, sprite_type]
+            return [sprite_type, task_folder]
+        return [variant, sprite_type, task_folder]
 
     def escape_drive_query_value(self, value: str):
         return value.replace("\\", "\\\\").replace("'", "\\'")
@@ -182,7 +436,7 @@ class Sprites(commands.Cog):
                     return None, "Failed to download attachment from Discord.", None
                 file_bytes = await resp.read()
 
-        safe_name = f"{variant}_{sprite_type}_{identifier}_{attachment.filename}".replace("/", "-")
+        safe_name = attachment.filename.replace("/", "-")
         media = MediaIoBaseUpload(
             io.BytesIO(file_bytes),
             mimetype=attachment.content_type or "application/octet-stream",
@@ -190,7 +444,7 @@ class Sprites(commands.Cog):
         )
         destination_folder_id = self.ensure_drive_folder_path(
             self.get_drive_folder_id(variant),
-            self.get_drive_subfolder_path(variant, sprite_type)
+            self.get_drive_subfolder_path(identifier, variant, sprite_type)
         )
 
         file_metadata = {
@@ -217,6 +471,47 @@ class Sprites(commands.Cog):
             if e.resp.status == 403 and "Service Accounts do not have storage quota" in str(e):
                 return attachment.url, None, "Discord attachment link (Google Drive quota blocked)"
             return None, str(e), None
+
+    async def upload_attachment_to_drive_folder(self, attachment: discord.Attachment, folder_id: str):
+        if self.drive_service is None:
+            return None, "Google Drive integration is offline. Check bot logs."
+        if not folder_id:
+            return None, "GOOGLE_DRIVE_FOLDER_ID is not set in .env."
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(attachment.url) as resp:
+                if resp.status != 200:
+                    return None, "Failed to download attachment from Discord."
+                file_bytes = await resp.read()
+
+        safe_name = attachment.filename.replace("/", "-")
+        media = MediaIoBaseUpload(
+            io.BytesIO(file_bytes),
+            mimetype=attachment.content_type or "application/octet-stream",
+            resumable=False
+        )
+        file_metadata = {
+            "name": safe_name,
+            "parents": [folder_id],
+        }
+
+        try:
+            uploaded_file = self.drive_service.files().create(
+                body=file_metadata,
+                media_body=media,
+                fields="id, webViewLink",
+                supportsAllDrives=True,
+            ).execute()
+
+            self.drive_service.permissions().create(
+                fileId=uploaded_file["id"],
+                body={"type": "anyone", "role": "reader"},
+                supportsAllDrives=True,
+            ).execute()
+
+            return uploaded_file["webViewLink"], None
+        except HttpError as e:
+            return None, str(e)
 
     async def finalize_submission(self, interaction: discord.Interaction, message: discord.Message, identifier: str, sprite_type: str, variant: str, required_statuses=("Assigned", "Waiting For Feedback")):
         if self.gc is None:
@@ -271,7 +566,26 @@ class Sprites(commands.Cog):
                 sheet_file_value,
                 artist_name
             ]
-            self.worksheet.append_row(row_data, value_input_option="USER_ENTERED")
+            worksheet = self.get_or_create_completed_worksheet(variant)
+            if self.get_task_sheet_group(variant) == "pokemon":
+                self.update_completed_pokemon_sheet(
+                    worksheet,
+                    identifier,
+                    variant,
+                    sprite_type,
+                    sheet_file_value,
+                    artist_name,
+                )
+            elif self.get_task_sheet_group(variant) == "character":
+                self.update_completed_character_sheet(
+                    worksheet,
+                    identifier,
+                    sprite_type,
+                    sheet_file_value,
+                    artist_name,
+                )
+            else:
+                worksheet.append_row(row_data, value_input_option="USER_ENTERED")
         except Exception as e:
             await interaction.followup.send(f"❌ Failed to update Google Sheets: {e}")
             return
@@ -299,14 +613,6 @@ class Sprites(commands.Cog):
         except Exception as e:
             await interaction.followup.send(f"❌ Database error during finalization: {e}")
 
-    @app_commands.command(name="voidcomplete", description="Finalize submitted work and push it to Sheets")
-    @app_commands.describe(
-        identifier="Pokemon name or Dex number",
-        sprite_type="Front, Back, Music, Sound Effect, Cry, etc.",
-        variant="Base, Shiny, Anomaly, Audio, Character, etc.",
-        message_id="Message id of the submitted attachment"
-    )
-    @app_commands.checks.has_any_role("Sprite Verifier", "Directors")
     async def voidcomplete(self, interaction: discord.Interaction, identifier: str, sprite_type: str, variant: str, message_id: str):
         await interaction.response.defer()
 
@@ -369,7 +675,7 @@ class WaitingSubmissionView(discord.ui.View):
 
 
 async def accept_submission_context_menu(interaction: discord.Interaction, message: discord.Message):
-    is_verifier = any(role.name in ("Sprite Verifier", "Directors") for role in interaction.user.roles)
+    is_verifier = any(role.name in ("Sprite Verifier", "Directors 🌇") for role in interaction.user.roles)
     if not is_verifier:
         await interaction.response.send_message("❌ You do not have the required role to use this action.", ephemeral=True)
         return
@@ -407,9 +713,55 @@ async def accept_submission_context_menu(interaction: discord.Interaction, messa
         ephemeral=True
     )
 
+
+async def push_to_drive_context_menu(interaction: discord.Interaction, message: discord.Message):
+    is_director = any(role.name == "Directors 🌇" for role in interaction.user.roles)
+    if not is_director:
+        await interaction.response.send_message("❌ Only Directors can push images to Drive.", ephemeral=True)
+        return
+
+    cog = interaction.client.get_cog("Sprites")
+    if cog is None:
+        await interaction.response.send_message("❌ Drive tools are not loaded.", ephemeral=True)
+        return
+
+    image_attachments = [attachment for attachment in message.attachments if cog.is_image_attachment(attachment)]
+    if not image_attachments:
+        await interaction.response.send_message("❌ That message has no image attachments to push.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    uploaded_links = []
+    failures = []
+    for attachment in image_attachments:
+        drive_url, error = await cog.upload_attachment_to_drive_folder(attachment, cog.default_drive_folder_id)
+        if error:
+            failures.append(f"{attachment.filename}: {error}")
+        else:
+            uploaded_links.append((attachment.filename, drive_url))
+
+    if not uploaded_links and failures:
+        await interaction.followup.send("❌ Failed to push images to Drive:\n" + "\n".join(failures[:5]), ephemeral=True)
+        return
+
+    lines = [f"✅ **{filename}**\n{drive_url}" for filename, drive_url in uploaded_links]
+    if failures:
+        lines.append("⚠️ Some images failed:\n" + "\n".join(failures[:5]))
+
+    await interaction.followup.send(
+        "Pushed to the general Drive drop-off folder:\n\n" + "\n".join(lines),
+        ephemeral=True
+    )
+
+
 async def setup(bot):
     await bot.add_cog(Sprites(bot))
     bot.tree.add_command(app_commands.ContextMenu(
         name="Accept Submission",
         callback=accept_submission_context_menu,
+    ))
+    bot.tree.add_command(app_commands.ContextMenu(
+        name="Push to Drive",
+        callback=push_to_drive_context_menu,
     ))

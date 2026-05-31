@@ -1,15 +1,50 @@
 import os
+import sqlite3
 from typing import Optional
 
 import discord
 
 
 STATUS_TAG_NAMES = {
+    "Available": "Missing / Needed",
+    "Unassigned": "Missing / Needed",
+    "Assigned": "Assigned",
+    "Waiting For Feedback": "Waiting for Feedback",
+    "Completed": "Accepted - Finished",
+}
+
+TASK_SUMMARY_ORDER = {
+    "pokemon": [
+        ("Base", "Front"),
+        ("Base", "Front 2"),
+        ("Base", "Back"),
+        ("Shiny", "Front"),
+        ("Shiny", "Front 2"),
+        ("Shiny", "Back"),
+        ("Anomaly", "Front"),
+        ("Anomaly", "Front 2"),
+        ("Anomaly", "Back"),
+        ("Base", "Icon"),
+    ],
+    "character": [
+        ("Character", "Design"),
+        ("Character", "Overworld"),
+        ("Character", "Battler"),
+    ],
+    "audio": [
+        ("Audio", "Music"),
+        ("Audio", "Sound Effect"),
+        ("Audio", "Cry"),
+    ],
+}
+
+STATUS_LABELS = {
     "Available": "Missing",
     "Unassigned": "Missing",
     "Assigned": "Assigned",
     "Waiting For Feedback": "Waiting for Feedback",
-    "Completed": "Complete",
+    "Completed": "Completed",
+    "Removed": "Removed",
 }
 
 
@@ -54,6 +89,90 @@ def get_status_tag(forum_channel: discord.ForumChannel, status: str):
     return get_forum_tag(forum_channel, tag_name)
 
 
+def get_task_group(rows):
+    variants = {row[1] for row in rows}
+    if "Audio" in variants:
+        return "audio"
+    if "Character" in variants:
+        return "character"
+    return "pokemon"
+
+
+def format_task_status(status: Optional[str]):
+    return STATUS_LABELS.get(status or "Available", status or "Missing")
+
+
+def build_task_forum_summary(thread_name: str, rows):
+    if not rows:
+        return (
+            f"**Task:** {thread_name}\n"
+            "**Status:** Missing\n\n"
+            "No task rows are currently linked to this forum post."
+        )
+
+    group = get_task_group(rows)
+    task_by_type = {
+        (variant, sprite_type): (status, user_id, min_level)
+        for _identifier, variant, sprite_type, status, user_id, min_level, _reference_image_url in rows
+    }
+    aggregate_statuses = [row[3] for row in rows]
+    reference_image_urls = sorted({row[6] for row in rows if row[6]})
+
+    if any(status == "Waiting For Feedback" for status in aggregate_statuses):
+        aggregate_status = "Waiting for Feedback"
+    elif any(status == "Assigned" for status in aggregate_statuses):
+        aggregate_status = "Assigned"
+    elif aggregate_statuses and all(status == "Completed" for status in aggregate_statuses):
+        aggregate_status = "Completed"
+    else:
+        aggregate_status = "Missing"
+
+    lines = []
+    for variant, sprite_type in TASK_SUMMARY_ORDER[group]:
+        label = f"{variant} {sprite_type}"
+        status, user_id, min_level = task_by_type.get((variant, sprite_type), (None, None, None))
+        status_text = format_task_status(status)
+        min_level_text = f" (Lv {min_level}+)" if min_level else ""
+        assignee_text = f" - <@{user_id}>" if user_id else ""
+        lines.append(f"{label}{min_level_text} - {status_text}{assignee_text}")
+
+    return (
+        f"**Task:** {thread_name}\n"
+        f"**Status:** {aggregate_status}\n\n"
+        + (f"**Reference:** {', '.join(reference_image_urls)}\n\n" if reference_image_urls else "")
+        +
+        "**Task Breakdown**\n"
+        + "\n".join(lines)
+    )
+
+
+async def update_task_forum_summary(bot, db_path: str, thread_id: Optional[int]):
+    if not thread_id:
+        return
+
+    thread = bot.get_channel(thread_id) or await bot.fetch_channel(thread_id)
+    if not isinstance(thread, discord.Thread):
+        return
+
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT pokedex_identifier, variant, sprite_type, status, user_id, min_level, reference_image_url
+            FROM tasks
+            WHERE forum_thread_id = ?
+            ORDER BY variant, sprite_type
+        """, (thread_id,))
+        rows = cursor.fetchall()
+
+    content = build_task_forum_summary(thread.name, rows)
+    try:
+        starter_message = await thread.fetch_message(thread.id)
+    except discord.HTTPException:
+        return
+
+    await starter_message.edit(content=content[:2000])
+
+
 async def get_task_forum_channel(bot, variant: str, sprite_type: str):
     forum_id = get_task_forum_id(variant, sprite_type)
     if not forum_id:
@@ -65,7 +184,14 @@ async def get_task_forum_channel(bot, variant: str, sprite_type: str):
     return None
 
 
-async def create_task_forum_post(bot, variant: str, sprite_type: str, identifier: str, title: Optional[str] = None):
+async def create_task_forum_post(
+    bot,
+    variant: str,
+    sprite_type: str,
+    identifier: str,
+    title: Optional[str] = None,
+    reference_image_url: Optional[str] = None,
+):
     forum_channel = await get_task_forum_channel(bot, variant, sprite_type)
     if not forum_channel:
         return None
@@ -78,6 +204,8 @@ async def create_task_forum_post(bot, variant: str, sprite_type: str, identifier
         content=(
             f"**Task:** {task_title}\n"
             "**Status:** Missing\n\n"
+            + (f"**Reference:** {reference_image_url}\n\n" if reference_image_url else "")
+            +
             "This task is available to claim from the task board."
         ),
         applied_tags=applied_tags,
