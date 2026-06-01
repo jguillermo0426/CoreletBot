@@ -908,10 +908,12 @@ class AssignTaskUserSelect(discord.ui.UserSelect):
                 available_tasks = cursor.fetchall()
 
             if available_tasks:
-                assignee_name = getattr(assignee, "display_name", assignee.name)
                 embed = discord.Embed(
                     title=getattr(interaction.channel, "name", "Assign Task"),
-                    description=f"Assigning to {assignee.mention}. Choose one of this thread's available tasks.",
+                    description=(
+                        f"Choose the task to assign in this thread, then pick who should get it.\n"
+                        f"Current assignee choice: {assignee.mention}"
+                    ),
                     color=discord.Color.dark_grey()
                 )
                 await interaction.response.edit_message(
@@ -920,9 +922,6 @@ class AssignTaskUserSelect(discord.ui.UserSelect):
                         self.bot,
                         self.db_path,
                         available_tasks,
-                        assignee.id,
-                        assignee_name,
-                        assignee.mention,
                         self.director_id
                     )
                 )
@@ -1038,7 +1037,7 @@ class AssignTaskTypeDropdown(discord.ui.Select):
 
         embed = discord.Embed(
             title=f"Assign {variant} {sprite_type}",
-            description=f"Assigning to {self.assignee_mention}. Choose one available task.",
+            description=f"Assigning to {self.assignee_mention}. Choose one or more available tasks.",
             color=discord.Color.dark_grey()
         )
         await interaction.response.edit_message(
@@ -1067,6 +1066,7 @@ class AssignAvailableTaskDropdown(discord.ui.Select):
         self.assignee_name = assignee_name
         self.assignee_mention = assignee_mention
         self.director_id = director_id
+        self.tasks_by_id = {}
         options = [
             discord.SelectOption(
                 label=identifier[:100],
@@ -1075,93 +1075,41 @@ class AssignAvailableTaskDropdown(discord.ui.Select):
             )
             for task_id, identifier, min_level in available_tasks
         ]
-        super().__init__(placeholder="Select an available task to assign...", min_values=1, max_values=1, options=options)
+        for task_id, identifier, min_level in available_tasks:
+            self.tasks_by_id[int(task_id)] = (identifier, min_level)
+        super().__init__(
+            placeholder="Select one or more available tasks to assign...",
+            min_values=1,
+            max_values=min(25, len(options)),
+            options=options,
+        )
 
     async def callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.director_id or not has_director_role(interaction.user):
             await interaction.response.send_message("❌ Only the Director who opened this menu can use it.", ephemeral=True)
             return
 
-        task_id = int(self.values[0])
-        now = datetime.now(timezone.utc)
-        due_date = now + timedelta(days=7)
+        await interaction.response.defer()
+        tasks_cog = interaction.client.get_cog("Tasks") or self.bot.get_cog("Tasks")
+        if tasks_cog is None:
+            await interaction.edit_original_response(content="❌ The task manager is not available right now.", embed=None, view=None)
+            return
 
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT pokedex_identifier, status, forum_thread_id, min_level
-                    FROM tasks
-                    WHERE task_id = ? AND variant = ? AND sprite_type = ?
-                """, (task_id, self.variant, self.sprite_type))
-                task = cursor.fetchone()
-
-                if not task:
-                    await interaction.response.edit_message(
-                        content="❌ That task no longer exists.",
-                        embed=None,
-                        view=None
-                    )
-                    return
-
-                identifier, status, thread_id, min_level = task
-                if status not in AVAILABLE_TASK_STATUSES:
-                    await interaction.response.edit_message(
-                        content=f"❌ **{self.variant} {self.sprite_type} — {identifier}** is no longer available.",
-                        embed=None,
-                        view=None
-                    )
-                    return
-
-                has_level, user_level = check_user_min_level(cursor, self.assignee_id, min_level)
-                if not has_level:
-                    await interaction.response.edit_message(
-                        content=(
-                            f"❌ **{self.assignee_mention}** is **Level {user_level}**, but "
-                            f"**{self.variant} {self.sprite_type} — {identifier}** requires **Level {min_level}**."
-                        ),
-                        embed=None,
-                        view=None
-                    )
-                    return
-
-                cursor.execute("""
-                    UPDATE tasks
-                    SET user_id = ?, status = 'Assigned', assigned_date = ?, due_date = ?
-                    WHERE task_id = ?
-                """, (self.assignee_id, now.isoformat(), due_date.isoformat(), task_id))
-                conn.commit()
-
-            await update_task_bundle_forum_status(
-                self.bot,
-                self.db_path,
-                thread_id,
-                f"{self.assignee_mention} was assigned this task by {interaction.user.mention}. Due: {due_date.strftime('%b %d, %Y')}."
-            )
-
-            embed = discord.Embed(
-                title="Task Assigned",
-                description=(
-                    f"✅ Assigned **{self.variant} {self.sprite_type} — {identifier}** to {self.assignee_mention}.\n"
-                    f"Due: **{due_date.strftime('%b %d, %Y')}**"
-                ),
-                color=discord.Color.green()
-            )
-            await interaction.response.edit_message(embed=embed, view=None)
-        except discord.Forbidden as e:
-            await interaction.response.edit_message(content=discord_access_error_message(e), embed=None, view=None)
-        except Exception as e:
-            await interaction.response.edit_message(content=f"Database error: {e}", embed=None, view=None)
+        await tasks_cog.assign_available_tasks_to_member(
+            interaction,
+            self.assignee_id,
+            self.assignee_mention,
+            self.values,
+            interaction.user.mention,
+        )
 
 
 class AssignThreadAvailableTaskDropdown(discord.ui.Select):
-    def __init__(self, bot, db_path: str, available_tasks, assignee_id: int, assignee_name: str, assignee_mention: str, director_id: int):
+    def __init__(self, bot, db_path: str, available_tasks, director_id: int):
         self.bot = bot
         self.db_path = db_path
-        self.assignee_id = assignee_id
-        self.assignee_name = assignee_name
-        self.assignee_mention = assignee_mention
         self.director_id = director_id
+        self.tasks_by_id = {}
         options = [
             discord.SelectOption(
                 label=f"{variant} {sprite_type}"[:100],
@@ -1170,7 +1118,14 @@ class AssignThreadAvailableTaskDropdown(discord.ui.Select):
             )
             for task_id, variant, sprite_type, identifier, min_level in available_tasks
         ]
-        super().__init__(placeholder="Select a task from this thread to assign...", min_values=1, max_values=1, options=options)
+        for task_id, variant, sprite_type, identifier, min_level in available_tasks:
+            self.tasks_by_id[int(task_id)] = (variant, sprite_type, identifier, min_level)
+        super().__init__(
+            placeholder="Select the task to assign...",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
 
     async def callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.director_id or not has_director_role(interaction.user):
@@ -1178,83 +1133,85 @@ class AssignThreadAvailableTaskDropdown(discord.ui.Select):
             return
 
         task_id = int(self.values[0])
-        now = datetime.now(timezone.utc)
-        due_date = now + timedelta(days=7)
+        task = self.tasks_by_id.get(task_id)
+        if not task:
+            await interaction.response.edit_message(content="❌ That task is no longer available.", embed=None, view=None)
+            return
 
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT variant, sprite_type, pokedex_identifier, status, forum_thread_id, min_level
-                    FROM tasks
-                    WHERE task_id = ?
-                """, (task_id,))
-                task = cursor.fetchone()
-
-                if not task:
-                    await interaction.response.edit_message(
-                        content="❌ That task no longer exists.",
-                        embed=None,
-                        view=None
-                    )
-                    return
-
-                variant, sprite_type, identifier, status, thread_id, min_level = task
-                if status not in AVAILABLE_TASK_STATUSES:
-                    await interaction.response.edit_message(
-                        content=f"❌ **{variant} {sprite_type} — {identifier}** is no longer available.",
-                        embed=None,
-                        view=None
-                    )
-                    return
-
-                if isinstance(interaction.channel, discord.Thread) and thread_id != interaction.channel.id:
-                    await interaction.response.edit_message(
-                        content="❌ That task is not part of this forum thread.",
-                        embed=None,
-                        view=None
-                    )
-                    return
-
-                has_level, user_level = check_user_min_level(cursor, self.assignee_id, min_level)
-                if not has_level:
-                    await interaction.response.edit_message(
-                        content=(
-                            f"❌ **{self.assignee_mention}** is **Level {user_level}**, but "
-                            f"**{variant} {sprite_type} — {identifier}** requires **Level {min_level}**."
-                        ),
-                        embed=None,
-                        view=None
-                    )
-                    return
-
-                cursor.execute("""
-                    UPDATE tasks
-                    SET user_id = ?, status = 'Assigned', assigned_date = ?, due_date = ?
-                    WHERE task_id = ?
-                """, (self.assignee_id, now.isoformat(), due_date.isoformat(), task_id))
-                conn.commit()
-
-            await update_task_bundle_forum_status(
+        variant, sprite_type, identifier, min_level = task
+        embed = discord.Embed(
+            title=f"Assign {variant} {sprite_type}",
+            description=(
+                f"**Task:** {variant} {sprite_type} - {identifier}\n"
+                f"**Minimum level:** {format_min_level(min_level)}\n\n"
+                "Now choose who should get this task."
+            ),
+            color=discord.Color.dark_grey()
+        )
+        await interaction.response.edit_message(
+            embed=embed,
+            view=AssignThreadAssigneeView(
                 self.bot,
                 self.db_path,
-                thread_id,
-                f"{self.assignee_mention} was assigned this task by {interaction.user.mention}. Due: {due_date.strftime('%b %d, %Y')}."
+                task_id,
+                variant,
+                sprite_type,
+                identifier,
+                min_level,
+                self.director_id,
             )
+        )
 
-            embed = discord.Embed(
-                title="Task Assigned",
-                description=(
-                    f"✅ Assigned **{variant} {sprite_type} — {identifier}** to {self.assignee_mention}.\n"
-                    f"Due: **{due_date.strftime('%b %d, %Y')}**"
-                ),
-                color=discord.Color.green()
+
+class AssignThreadAssigneeSelect(discord.ui.UserSelect):
+    def __init__(self, bot, db_path: str, task_id: int, variant: str, sprite_type: str, identifier: str, min_level, director_id: int):
+        self.bot = bot
+        self.db_path = db_path
+        self.task_id = task_id
+        self.variant = variant
+        self.sprite_type = sprite_type
+        self.identifier = identifier
+        self.min_level = min_level
+        self.director_id = director_id
+        super().__init__(placeholder="Select the assignee for this task...", min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.director_id or not has_director_role(interaction.user):
+            await interaction.response.send_message("❌ Only the Director who opened this menu can use it.", ephemeral=True)
+            return
+
+        assignee = self.values[0]
+        tasks_cog = interaction.client.get_cog("Tasks") or self.bot.get_cog("Tasks")
+        if tasks_cog is None:
+            await interaction.response.edit_message(content="❌ The task manager is not available right now.", embed=None, view=None)
+            return
+
+        await interaction.response.defer()
+        await tasks_cog.assign_available_tasks_to_member(
+            interaction,
+            assignee.id,
+            assignee.mention,
+            [self.task_id],
+            interaction.user.mention,
+            thread_id=interaction.channel.id if isinstance(interaction.channel, discord.Thread) else None,
+        )
+
+
+class AssignThreadAssigneeView(discord.ui.View):
+    def __init__(self, bot, db_path: str, task_id: int, variant: str, sprite_type: str, identifier: str, min_level, director_id: int):
+        super().__init__(timeout=300)
+        self.add_item(
+            AssignThreadAssigneeSelect(
+                bot,
+                db_path,
+                task_id,
+                variant,
+                sprite_type,
+                identifier,
+                min_level,
+                director_id,
             )
-            await interaction.response.edit_message(embed=embed, view=None)
-        except discord.Forbidden as e:
-            await interaction.response.edit_message(content=discord_access_error_message(e), embed=None, view=None)
-        except Exception as e:
-            await interaction.response.edit_message(content=f"Database error: {e}", embed=None, view=None)
+        )
 
 
 class AddTaskCategoryDropdown(discord.ui.Select):
@@ -2612,6 +2569,129 @@ class Tasks(commands.Cog):
         except Exception as e:
             await interaction.response.send_message(f"Database error: {e}", ephemeral=True)
 
+    async def assign_available_tasks_to_member(
+        self,
+        interaction: discord.Interaction,
+        assignee_id: int,
+        assignee_mention: str,
+        task_ids,
+        director_mention: str,
+        thread_id: Optional[int] = None,
+    ):
+        now = datetime.now(timezone.utc)
+        due_date = now + timedelta(days=7)
+        selected_task_ids = [int(task_id) for task_id in task_ids]
+        assigned_tasks = []
+        skipped_tasks = []
+        forum_updates = []
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+
+                for task_id in selected_task_ids:
+                    cursor.execute("""
+                        SELECT task_id, variant, sprite_type, pokedex_identifier, status, forum_thread_id, min_level
+                        FROM tasks
+                        WHERE task_id = ?
+                    """, (task_id,))
+                    task = cursor.fetchone()
+
+                    if not task:
+                        skipped_tasks.append(f"Task #{task_id} was not found.")
+                        continue
+
+                    task_id, variant, sprite_type, identifier, status, task_thread_id, min_level = task
+
+                    if status not in AVAILABLE_TASK_STATUSES:
+                        skipped_tasks.append(
+                            f"**{variant} {sprite_type} - {identifier}** is no longer available."
+                        )
+                        continue
+
+                    if thread_id is not None and task_thread_id != thread_id:
+                        skipped_tasks.append(
+                            f"**{variant} {sprite_type} - {identifier}** is not part of this thread."
+                        )
+                        continue
+
+                    has_level, user_level = check_user_min_level(cursor, assignee_id, min_level)
+                    if not has_level:
+                        skipped_tasks.append(
+                            f"**{variant} {sprite_type} - {identifier}** requires Level {min_level}, but {assignee_mention} is Level {user_level}."
+                        )
+                        continue
+
+                    cursor.execute("""
+                        UPDATE tasks
+                        SET user_id = ?, status = 'Assigned', assigned_date = ?, due_date = ?
+                        WHERE task_id = ?
+                    """, (assignee_id, now.isoformat(), due_date.isoformat(), task_id))
+
+                    assigned_tasks.append((variant, sprite_type, identifier))
+                    forum_updates.append((task_thread_id, variant, sprite_type, identifier))
+
+                conn.commit()
+
+            for task_thread_id, variant, sprite_type, identifier in forum_updates:
+                if not task_thread_id:
+                    continue
+                await update_task_bundle_forum_status(
+                    self.bot,
+                    self.db_path,
+                    task_thread_id,
+                    f"{assignee_mention} was assigned this task by {director_mention}. Due: {due_date.strftime('%b %d, %Y')}."
+                )
+
+            if assigned_tasks:
+                description_lines = [
+                    f"✅ Assigned **{len(assigned_tasks)}** task{'s' if len(assigned_tasks) != 1 else ''} to {assignee_mention}.",
+                    f"Due: **{due_date.strftime('%b %d, %Y')}**",
+                ]
+                if assigned_tasks:
+                    description_lines.append("")
+                    description_lines.append("Assigned:")
+                    for variant, sprite_type, identifier in assigned_tasks[:10]:
+                        description_lines.append(f"- {variant} {sprite_type} — {identifier}")
+                    if len(assigned_tasks) > 10:
+                        description_lines.append(f"- ...and {len(assigned_tasks) - 10} more")
+                if skipped_tasks:
+                    description_lines.append("")
+                    description_lines.append("Skipped:")
+                    for message in skipped_tasks[:10]:
+                        description_lines.append(f"- {message}")
+                    if len(skipped_tasks) > 10:
+                        description_lines.append(f"- ...and {len(skipped_tasks) - 10} more")
+
+                embed = discord.Embed(
+                    title="Tasks Assigned",
+                    description="\n".join(description_lines),
+                    color=discord.Color.green()
+                )
+            else:
+                description_lines = [
+                    "❌ None of the selected tasks could be assigned.",
+                ]
+                if skipped_tasks:
+                    description_lines.append("")
+                    description_lines.append("Skipped:")
+                    for message in skipped_tasks[:10]:
+                        description_lines.append(f"- {message}")
+                    if len(skipped_tasks) > 10:
+                        description_lines.append(f"- ...and {len(skipped_tasks) - 10} more")
+
+                embed = discord.Embed(
+                    title="No Tasks Assigned",
+                    description="\n".join(description_lines),
+                    color=discord.Color.red()
+                )
+
+            await interaction.edit_original_response(embed=embed, view=None)
+        except discord.Forbidden as e:
+            await interaction.edit_original_response(content=discord_access_error_message(e), embed=None, view=None)
+        except Exception as e:
+            await interaction.edit_original_response(content=f"Database error: {e}", embed=None, view=None)
+
     async def send_active_tasks(self, interaction: discord.Interaction):
         try:
             active_tasks = fetch_active_task_rows(self.db_path)
@@ -2684,6 +2764,26 @@ class Tasks(commands.Cog):
     @app_commands.command(name="assigntaskmenu", description="Open a menu for assigning an available task")
     async def assigntaskmenu(self, interaction: discord.Interaction):
         if not await self.require_director(interaction):
+            return
+
+        if isinstance(interaction.channel, discord.Thread):
+            available_tasks = self.get_thread_available_tasks(interaction.channel)
+            if not available_tasks:
+                await interaction.response.send_message(
+                    "❌ There are no available tasks in this thread.",
+                    ephemeral=True
+                )
+                return
+
+            embed = discord.Embed(
+                title=getattr(interaction.channel, "name", "Assign Task"),
+                description="Choose the task to assign first, then pick the assignee for that task.",
+                color=discord.Color.dark_grey()
+            )
+            await interaction.response.send_message(
+                embed=embed,
+                view=AssignThreadAvailableTaskView(self.bot, self.db_path, available_tasks, interaction.user.id)
+            )
             return
 
         embed = discord.Embed(
@@ -3677,9 +3777,9 @@ class AssignAvailableTaskView(discord.ui.View):
 
 
 class AssignThreadAvailableTaskView(discord.ui.View):
-    def __init__(self, bot, db_path: str, available_tasks, assignee_id: int, assignee_name: str, assignee_mention: str, director_id: int):
+    def __init__(self, bot, db_path: str, available_tasks, director_id: int):
         super().__init__(timeout=300)
-        self.add_item(AssignThreadAvailableTaskDropdown(bot, db_path, available_tasks, assignee_id, assignee_name, assignee_mention, director_id))
+        self.add_item(AssignThreadAvailableTaskDropdown(bot, db_path, available_tasks, director_id))
 
 
 class AddTaskCategoryView(discord.ui.View):

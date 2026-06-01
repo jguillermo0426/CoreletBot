@@ -5,3 +5,4 @@ data/google_token.json
 __pycache__/
 *.pyc
 .venv
+data/corelet.db
