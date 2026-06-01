@@ -12,7 +12,7 @@ import base64
 import aiohttp
 from gspread.exceptions import WorksheetNotFound
 from google_auth import get_google_credentials
-from task_forum import update_task_forum_status, update_task_forum_summary
+from task_forum import ensure_task_link_columns, update_task_forum_status, update_task_forum_summary
 
 COMPLETED_TASK_SHEETS = {
     "pokemon": "Completed Pokemon Tasks",
@@ -124,14 +124,16 @@ async def update_task_bundle_forum_status(bot, db_path: str, thread_id, message=
     else:
         aggregate_status = "Available"
 
-    await update_task_forum_status(bot, thread_id, aggregate_status, message)
+    sent_message = await update_task_forum_status(bot, thread_id, aggregate_status, message)
     await update_task_forum_summary(bot, db_path, thread_id)
+    return sent_message
 
 
 class Sprites(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.db_path = "data/corelet.db"
+        ensure_task_link_columns(self.db_path)
         self.tasks_per_level = 5
         
         self.default_drive_folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
@@ -591,7 +593,10 @@ class Sprites(commands.Cog):
             return
 
         try:
-            self.execute_query("UPDATE tasks SET status = 'Completed' WHERE task_id = ?", (task_id,))
+            self.execute_query(
+                "UPDATE tasks SET status = 'Completed', completion_message_url = ? WHERE task_id = ?",
+                (message.jump_url, task_id),
+            )
             self.execute_query("UPDATE users SET tasks_completed = tasks_completed + 1 WHERE user_id = ?", (user_id,))
             await update_task_bundle_forum_status(
                 self.bot,

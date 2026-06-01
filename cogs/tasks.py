@@ -5,7 +5,13 @@ import sqlite3
 import re
 import os
 from datetime import datetime, timedelta, timezone
-from task_forum import create_task_forum_post, update_task_forum_status, update_task_forum_summary
+from typing import Optional
+from task_forum import (
+    create_task_forum_post,
+    ensure_task_link_columns,
+    update_task_forum_status,
+    update_task_forum_summary,
+)
 
 AVAILABLE_TASK_STATUSES = ("Available", "Unassigned")
 ACTIVE_TASK_STATUSES = ("Available", "Unassigned", "Assigned", "Waiting For Feedback")
@@ -55,6 +61,60 @@ TASK_CATEGORY_OPTIONS = {
 
 POKEMON_TASK_VALUES = [option.value for option in TASK_CATEGORY_OPTIONS["pokemon_sprite"]["options"]]
 CHARACTER_TASK_VALUES = [option.value for option in TASK_CATEGORY_OPTIONS["character_sprite"]["options"]]
+TASK_BOARD_CATEGORY_OPTIONS = {
+    "pokemon_sprite": {
+        "label": "Spriting",
+        "description": "Pokemon sprite tasks grouped by Pokemon",
+        "emoji": "🟩",
+        "title": "Pokemon Spriting Tasks",
+    },
+    "character_sprite": {
+        "label": "Characters",
+        "description": "Character tasks grouped by character",
+        "emoji": "🎨",
+        "title": "Character Tasks",
+    },
+    "music": {
+        "label": "Music",
+        "description": "Music tasks grouped by track or cue",
+        "emoji": "🎵",
+        "title": "Music Tasks",
+    },
+}
+
+TASK_BOARD_GROUPS = {
+    "pokemon_sprite": {
+        "variants": ("Base", "Shiny", "Anomaly"),
+        "sprite_types": None,
+        "group_label": "Pokemon",
+        "empty_message": "There are no available Pokemon spriting tasks right now.",
+    },
+    "character_sprite": {
+        "variants": ("Character",),
+        "sprite_types": None,
+        "group_label": "character",
+        "empty_message": "There are no available character tasks right now.",
+    },
+    "music": {
+        "variants": ("Audio",),
+        "sprite_types": ("Music",),
+        "group_label": "music task",
+        "empty_message": "There are no available music tasks right now.",
+    },
+}
+
+POKEMON_BOARD_TASK_SLOTS = (
+    ("Base", "Icon"),
+    ("Base", "Front"),
+    ("Base", "Front 2"),
+    ("Base", "Back"),
+    ("Shiny", "Front"),
+    ("Shiny", "Front 2"),
+    ("Shiny", "Back"),
+    ("Anomaly", "Front"),
+    ("Anomaly", "Front 2"),
+    ("Anomaly", "Back"),
+)
 
 
 def has_director_role(user) -> bool:
@@ -96,7 +156,7 @@ def get_task_request_channel_ids():
     return channel_ids
 
 
-def fetch_active_task_rows(db_path: str, user_id: int | None = None):
+def fetch_active_task_rows(db_path: str, user_id: Optional[int] = None):
     params = []
     user_filter = ""
     statuses = ACTIVE_TASK_STATUSES
@@ -118,6 +178,90 @@ def fetch_active_task_rows(db_path: str, user_id: int | None = None):
         return cursor.fetchall()
 
 
+def normalize_task_search_args(scope: Optional[str], category: Optional[str]):
+    values = []
+    for value in (scope, category):
+        if value:
+            values.extend(part.strip().casefold() for part in value.split() if part.strip())
+
+    can_do_only = "can" in values
+    category_key = None
+    category_aliases = {
+        "pokemon": "pokemon",
+        "spriting": "pokemon",
+        "sprite": "pokemon",
+        "sprites": "pokemon",
+        "character": "character",
+        "characters": "character",
+        "char": "character",
+        "music": "music",
+        "song": "music",
+        "songs": "music",
+        "other": "other",
+        "others": "other",
+        "sound": "other",
+        "sounds": "other",
+        "sfx": "other",
+        "cry": "other",
+        "cries": "other",
+    }
+
+    unknown_terms = []
+    for value in values:
+        if value == "can":
+            continue
+        if value in category_aliases:
+            category_key = category_aliases[value]
+        else:
+            unknown_terms.append(value)
+
+    return can_do_only, category_key, unknown_terms
+
+
+def fetch_available_task_search_rows(db_path: str, category_key: Optional[str], user_level: Optional[int]):
+    clauses = ["status IN ('Available', 'Unassigned')"]
+    params = []
+
+    if user_level is not None:
+        clauses.append("(min_level IS NULL OR min_level <= ?)")
+        params.append(user_level)
+
+    if category_key == "pokemon":
+        clauses.append("variant IN ('Base', 'Shiny', 'Anomaly')")
+    elif category_key == "character":
+        clauses.append("variant = 'Character'")
+    elif category_key == "music":
+        clauses.append("variant = 'Audio' AND sprite_type = 'Music'")
+    elif category_key == "other":
+        clauses.append("""
+            NOT (
+                variant IN ('Base', 'Shiny', 'Anomaly')
+                OR variant = 'Character'
+                OR (variant = 'Audio' AND sprite_type = 'Music')
+            )
+        """)
+
+    where_clause = " AND ".join(clauses)
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT task_id, variant, sprite_type, pokedex_identifier, min_level, reference_image_url, forum_thread_id
+            FROM tasks
+            WHERE {where_clause}
+            ORDER BY
+                CASE
+                    WHEN variant IN ('Base', 'Shiny', 'Anomaly') THEN 1
+                    WHEN variant = 'Character' THEN 2
+                    WHEN variant = 'Audio' AND sprite_type = 'Music' THEN 3
+                    ELSE 4
+                END,
+                pokedex_identifier COLLATE NOCASE,
+                variant,
+                sprite_type
+        """, tuple(params))
+        return cursor.fetchall()
+
+
 def parse_min_level(value: str):
     value = value.strip()
     if not value:
@@ -135,7 +279,7 @@ def format_min_level(min_level):
     return f"Lv {min_level}+" if min_level else "No level req"
 
 
-def normalize_reference_image_url(value: str | None):
+def normalize_reference_image_url(value: Optional[str]):
     if value is None:
         return None
 
@@ -145,6 +289,53 @@ def normalize_reference_image_url(value: str | None):
 
 def format_reference_image(reference_image_url):
     return f"[Open reference]({reference_image_url})" if reference_image_url else "None"
+
+
+def is_ephemeral_discord_attachment(url: Optional[str]) -> bool:
+    return bool(url and "/ephemeral-attachments/" in url)
+
+
+def choose_renderable_reference_image(task_rows):
+    reference_urls = [row[6] for row in task_rows if row[6]]
+    for reference_url in reference_urls:
+        if not is_ephemeral_discord_attachment(reference_url):
+            return reference_url
+    return None
+
+
+def is_image_attachment(attachment: discord.Attachment) -> bool:
+    content_type = attachment.content_type or ""
+    filename = attachment.filename.casefold()
+    return content_type.startswith("image/") or filename.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))
+
+
+def extract_reference_image_from_message(message: discord.Message):
+    fallback_url = None
+
+    for attachment in message.attachments:
+        if not is_image_attachment(attachment):
+            continue
+        if not is_ephemeral_discord_attachment(attachment.url):
+            return attachment.url
+        fallback_url = fallback_url or getattr(attachment, "proxy_url", None)
+
+    for embed in message.embeds:
+        image_url = getattr(getattr(embed, "image", None), "url", None)
+        if image_url and not is_ephemeral_discord_attachment(image_url):
+            return image_url
+        fallback_url = fallback_url or getattr(getattr(embed, "image", None), "proxy_url", None)
+
+        thumbnail_url = getattr(getattr(embed, "thumbnail", None), "url", None)
+        if thumbnail_url and not is_ephemeral_discord_attachment(thumbnail_url):
+            return thumbnail_url
+        fallback_url = fallback_url or getattr(getattr(embed, "thumbnail", None), "proxy_url", None)
+
+    for url in re.findall(r"https?://\S+", message.content or ""):
+        cleaned_url = url.rstrip(">)].,")
+        if not is_ephemeral_discord_attachment(cleaned_url):
+            return cleaned_url
+
+    return fallback_url
 
 
 def fetch_user_level(cursor, user_id: int):
@@ -158,6 +349,232 @@ def check_user_min_level(cursor, user_id: int, min_level):
     if min_level and user_level < min_level:
         return False, user_level
     return True, user_level
+
+
+def build_task_board_filter(category_key: str):
+    config = TASK_BOARD_GROUPS[category_key]
+    clauses = ["status IN ('Available', 'Unassigned')"]
+    params = []
+
+    variants = config["variants"]
+    variant_placeholders = ", ".join("?" for _ in variants)
+    clauses.append(f"variant IN ({variant_placeholders})")
+    params.extend(variants)
+
+    sprite_types = config["sprite_types"]
+    if sprite_types:
+        sprite_type_placeholders = ", ".join("?" for _ in sprite_types)
+        clauses.append(f"sprite_type IN ({sprite_type_placeholders})")
+        params.extend(sprite_types)
+
+    return " AND ".join(clauses), tuple(params)
+
+
+def build_task_board_scope_filter(category_key: str, statuses):
+    config = TASK_BOARD_GROUPS[category_key]
+    clauses = [f"status IN ({', '.join('?' for _ in statuses)})"]
+    params = list(statuses)
+
+    variants = config["variants"]
+    variant_placeholders = ", ".join("?" for _ in variants)
+    clauses.append(f"variant IN ({variant_placeholders})")
+    params.extend(variants)
+
+    sprite_types = config["sprite_types"]
+    if sprite_types:
+        sprite_type_placeholders = ", ".join("?" for _ in sprite_types)
+        clauses.append(f"sprite_type IN ({sprite_type_placeholders})")
+        params.extend(sprite_types)
+
+    return " AND ".join(clauses), tuple(params)
+
+
+def fetch_available_task_groups(db_path: str, category_key: str):
+    where_clause, params = build_task_board_filter(category_key)
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT pokedex_identifier, COUNT(*), MIN(min_level), MAX(reference_image_url)
+            FROM tasks
+            WHERE {where_clause}
+            GROUP BY pokedex_identifier
+            ORDER BY pokedex_identifier COLLATE NOCASE
+        """, params)
+        return cursor.fetchall()
+
+
+def fetch_available_group_tasks(db_path: str, category_key: str, identifier: str):
+    where_clause, params = build_task_board_filter(category_key)
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT task_id, variant, sprite_type, pokedex_identifier, min_level
+            FROM tasks
+            WHERE {where_clause}
+              AND pokedex_identifier = ?
+            ORDER BY
+                CASE variant
+                    WHEN 'Base' THEN 1
+                    WHEN 'Shiny' THEN 2
+                    WHEN 'Anomaly' THEN 3
+                    WHEN 'Character' THEN 4
+                    WHEN 'Audio' THEN 5
+                    ELSE 5
+                END,
+                CASE sprite_type
+                    WHEN 'Design' THEN 1
+                    WHEN 'Overworld' THEN 2
+                    WHEN 'Battler' THEN 3
+                    ELSE 4
+                END,
+                sprite_type COLLATE NOCASE
+        """, (*params, identifier))
+        return cursor.fetchall()
+
+
+def fetch_task_group_details(db_path: str, category_key: str, identifier: str):
+    statuses = ("Available", "Unassigned", "Assigned", "Waiting For Feedback", "Completed")
+    where_clause, params = build_task_board_scope_filter(category_key, statuses)
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT task_id, variant, sprite_type, status, user_id, min_level,
+                   reference_image_url, forum_thread_id
+            FROM tasks
+            WHERE {where_clause}
+              AND pokedex_identifier = ?
+            ORDER BY
+                CASE variant
+                    WHEN 'Base' THEN 1
+                    WHEN 'Shiny' THEN 2
+                    WHEN 'Anomaly' THEN 3
+                    WHEN 'Character' THEN 4
+                    WHEN 'Audio' THEN 5
+                    ELSE 6
+                END,
+                CASE sprite_type
+                    WHEN 'Icon' THEN 0
+                    WHEN 'Front' THEN 1
+                    WHEN 'Front 2' THEN 2
+                    WHEN 'Back' THEN 3
+                    WHEN 'Design' THEN 1
+                    WHEN 'Overworld' THEN 2
+                    WHEN 'Battler' THEN 3
+                    ELSE 4
+                END,
+                sprite_type COLLATE NOCASE
+        """, (*params, identifier))
+        return cursor.fetchall()
+
+
+def format_board_task_label(variant: str, sprite_type: str):
+    sprite_suffixes = {
+        "Front": "F",
+        "Front 2": "F2",
+        "Back": "B",
+        "Icon": "Icons",
+    }
+    if variant == "Base":
+        if sprite_type == "Icon":
+            return "Icons"
+        return f"Normal{sprite_suffixes.get(sprite_type, sprite_type)}"
+    if variant in {"Shiny", "Anomaly"}:
+        return f"{variant}{sprite_suffixes.get(sprite_type, sprite_type)}"
+    if variant == "Character":
+        return sprite_type
+    if variant == "Audio":
+        return sprite_type
+    return f"{variant} {sprite_type}"
+
+
+def format_board_task_line(variant: str, sprite_type: str, status: str, user_id):
+    line = format_board_task_label(variant, sprite_type)
+    if user_id:
+        return f"{line} <@{user_id}>"
+    if status == "Waiting For Feedback":
+        return f"{line} (Waiting For Feedback)"
+    if status == "Completed":
+        return f"{line} (Completed)"
+    return line
+
+
+def build_board_task_lines(category_key: str, task_rows):
+    if category_key != "pokemon_sprite":
+        return [
+            format_board_task_line(variant, sprite_type, status, user_id)
+            for _task_id, variant, sprite_type, status, user_id, _min_level, _reference_image_url, _thread_id in task_rows
+        ]
+
+    task_by_slot = {
+        (variant, sprite_type): (status, user_id)
+        for _task_id, variant, sprite_type, status, user_id, _min_level, _reference_image_url, _thread_id in task_rows
+    }
+    lines = []
+    previous_variant = None
+    for variant, sprite_type in POKEMON_BOARD_TASK_SLOTS:
+        if previous_variant and previous_variant != variant:
+            lines.append("")
+        status, user_id = task_by_slot.get((variant, sprite_type), ("Available", None))
+        lines.append(format_board_task_line(variant, sprite_type, status, user_id))
+        previous_variant = variant
+    return lines
+
+
+def parse_pokemon_sprite_alias(value: str):
+    clean_value = re.sub(r"[\s_-]+", "", value.strip().casefold())
+    aliases = {
+        "f": ("Base", "Front"),
+        "front": ("Base", "Front"),
+        "basefront": ("Base", "Front"),
+        "f2": ("Base", "Front 2"),
+        "front2": ("Base", "Front 2"),
+        "basefront2": ("Base", "Front 2"),
+        "b": ("Base", "Back"),
+        "back": ("Base", "Back"),
+        "baseback": ("Base", "Back"),
+        "sf": ("Shiny", "Front"),
+        "shinyfront": ("Shiny", "Front"),
+        "sf2": ("Shiny", "Front 2"),
+        "shinyfront2": ("Shiny", "Front 2"),
+        "sb": ("Shiny", "Back"),
+        "shinyback": ("Shiny", "Back"),
+        "af": ("Anomaly", "Front"),
+        "anomalyfront": ("Anomaly", "Front"),
+        "af2": ("Anomaly", "Front 2"),
+        "anomalyfront2": ("Anomaly", "Front 2"),
+        "ab": ("Anomaly", "Back"),
+        "anomalyback": ("Anomaly", "Back"),
+        "i": ("Base", "Icon"),
+        "icon": ("Base", "Icon"),
+        "baseicon": ("Base", "Icon"),
+    }
+    return aliases.get(clean_value)
+
+
+def build_identifier_search(identifier: Optional[str]):
+    if not identifier:
+        return "", ()
+
+    clean_identifier = identifier.strip()
+    if not clean_identifier:
+        return "", ()
+
+    normalized_identifier = normalize_pokemon_identifier(clean_identifier)
+    if normalized_identifier:
+        return "AND pokedex_identifier = ?", (normalized_identifier,)
+
+    lowered_identifier = clean_identifier.casefold()
+    if clean_identifier.isdigit():
+        dex_number = str(int(clean_identifier))
+        return (
+            "AND (pokedex_identifier LIKE ? OR pokedex_identifier LIKE ?)",
+            (f"{clean_identifier} - %", f"{dex_number} - %"),
+        )
+
+    return (
+        "AND (LOWER(pokedex_identifier) = ? OR LOWER(pokedex_identifier) LIKE ?)",
+        (lowered_identifier, f"% - {lowered_identifier}"),
+    )
 
 
 async def update_task_bundle_forum_status(bot, db_path: str, thread_id, message=None):
@@ -188,8 +605,9 @@ async def update_task_bundle_forum_status(bot, db_path: str, thread_id, message=
     else:
         aggregate_status = "Available"
 
-    await update_task_forum_status(bot, thread_id, aggregate_status, message)
+    sent_message = await update_task_forum_status(bot, thread_id, aggregate_status, message)
     await update_task_forum_summary(bot, db_path, thread_id)
+    return sent_message
 
 
 # --- 2. The Dropdown Menus (Selects) ---
@@ -205,21 +623,28 @@ class TaskCategoryDropdown(discord.ui.Select):
                 description=category["description"],
                 emoji=category["emoji"],
             )
-            for key, category in TASK_CATEGORY_OPTIONS.items()
+            for key, category in TASK_BOARD_CATEGORY_OPTIONS.items()
         ]
         super().__init__(placeholder="Select a task category...", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
         category_key = self.values[0]
-        category = TASK_CATEGORY_OPTIONS[category_key]
+        groups = fetch_available_task_groups(self.db_path, category_key)
+        category = TASK_BOARD_CATEGORY_OPTIONS[category_key]
 
-        embed = discord.Embed(
-            title=category["label"],
-            description="Choose the specific task type you want to claim.",
-            color=discord.Color.dark_grey()
-        )
-        view = TaskTypeView(self.bot, self.db_path, category_key)
-        await interaction.response.send_message(embed=embed, view=view)
+        if not groups:
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    title=category["title"],
+                    description=TASK_BOARD_GROUPS[category_key]["empty_message"],
+                    color=discord.Color.red()
+                ),
+                ephemeral=True
+            )
+            return
+
+        view = AvailableTaskGroupView(self.bot, self.db_path, category_key, groups, interaction.user.id)
+        await interaction.response.send_message(embed=await view.build_embed(), view=view)
 
 
 class TaskTypeDropdown(discord.ui.Select):
@@ -361,7 +786,7 @@ class AvailableTaskDropdown(discord.ui.Select):
 
 
 class ThreadAvailableTaskDropdown(discord.ui.Select):
-    def __init__(self, bot, db_path: str, available_tasks):
+    def __init__(self, bot, db_path: str, available_tasks, placeholder: str = "Select a task from this thread..."):
         self.bot = bot
         self.db_path = db_path
         options = [
@@ -372,7 +797,7 @@ class ThreadAvailableTaskDropdown(discord.ui.Select):
             )
             for task_id, variant, sprite_type, identifier, min_level in available_tasks
         ]
-        super().__init__(placeholder="Select a task from this thread...", min_values=1, max_values=1, options=options)
+        super().__init__(placeholder=placeholder, min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
         task_id = int(self.values[0])
@@ -1344,15 +1769,28 @@ class RequestFeedbackDropdown(discord.ui.Select):
                     return
 
                 variant, sprite_type, identifier, thread_id = task
-                cursor.execute("UPDATE tasks SET status = 'Waiting For Feedback' WHERE task_id = ?", (task_id,))
+                cursor.execute("""
+                    UPDATE tasks
+                    SET status = 'Waiting For Feedback', feedback_message_url = NULL
+                    WHERE task_id = ?
+                """, (task_id,))
                 conn.commit()
 
-            await update_task_bundle_forum_status(
+            status_message = await update_task_bundle_forum_status(
                 self.bot,
                 self.db_path,
                 thread_id,
                 f"{interaction.user.mention} marked this task as Waiting for Feedback."
             )
+            if status_message:
+                with sqlite3.connect(self.db_path) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "UPDATE tasks SET feedback_message_url = ? WHERE task_id = ?",
+                        (status_message.jump_url, task_id),
+                    )
+                    conn.commit()
+                await update_task_forum_summary(self.bot, self.db_path, thread_id)
 
             embed = discord.Embed(
                 title="Ready For Feedback",
@@ -1450,15 +1888,175 @@ class CancelTaskDropdown(discord.ui.Select):
             await interaction.response.edit_message(content=f"Database error: {e}", embed=None, view=None)
 
 
+class ReassignTaskSelectDropdown(discord.ui.Select):
+    def __init__(self, bot, db_path: str, reassignable_tasks, director_id: int):
+        self.bot = bot
+        self.db_path = db_path
+        self.director_id = director_id
+        self.tasks_by_id = {}
+        options = []
+
+        for task_id, variant, sprite_type, identifier, status, user_id, artist_name, due_date_str in reassignable_tasks:
+            task_id = int(task_id)
+            self.tasks_by_id[task_id] = (
+                task_id,
+                variant,
+                sprite_type,
+                identifier,
+                status,
+                user_id,
+                artist_name,
+                due_date_str,
+            )
+
+            due_text = "No due date"
+            if due_date_str:
+                due_text = datetime.fromisoformat(due_date_str).strftime('%b %d, %Y')
+
+            if status == "Completed":
+                description = f"Completed by {artist_name}"
+            else:
+                description = f"{status} | {artist_name} | Due {due_text}"
+
+            options.append(discord.SelectOption(
+                label=f"{variant} {sprite_type} - {identifier}"[:100],
+                value=str(task_id),
+                description=description[:100],
+            ))
+
+        super().__init__(placeholder="Select the task to reassign...", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.director_id or not has_director_role(interaction.user):
+            await interaction.response.send_message("❌ Only the Director who opened this menu can use it.", ephemeral=True)
+            return
+
+        task_id = int(self.values[0])
+        task = self.tasks_by_id.get(task_id)
+        if not task:
+            await interaction.response.edit_message(content="❌ That task is no longer available for reassignment.", embed=None, view=None)
+            return
+
+        _task_id, variant, sprite_type, identifier, status, user_id, artist_name, due_date_str = task
+        due_text = "No due date"
+        if due_date_str:
+            due_text = datetime.fromisoformat(due_date_str).strftime('%b %d, %Y')
+
+        assigned_text = f"<@{user_id}>" if user_id else "Unassigned"
+        embed = discord.Embed(
+            title=f"Reassign {variant} {sprite_type}",
+            description=(
+                f"**Task:** {variant} {sprite_type} - {identifier}\n"
+                f"**Current assignee:** {assigned_text}\n"
+                f"**Status:** {status}\n"
+                f"**Due:** {due_text}\n\n"
+                "Choose the new assignee."
+            ),
+            color=discord.Color.dark_grey()
+        )
+        await interaction.response.edit_message(
+            embed=embed,
+            view=ReassignTaskAssigneeView(
+                self.bot,
+                self.db_path,
+                task,
+                self.director_id
+            )
+        )
+
+
+class ReassignTaskAssigneeSelect(discord.ui.UserSelect):
+    def __init__(self, bot, db_path: str, task, director_id: int):
+        self.bot = bot
+        self.db_path = db_path
+        self.task = task
+        self.director_id = director_id
+        super().__init__(placeholder="Select the new assignee...", min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.director_id or not has_director_role(interaction.user):
+            await interaction.response.send_message("❌ Only the Director who opened this menu can use it.", ephemeral=True)
+            return
+
+        assignee = self.values[0]
+        task_id, variant, sprite_type, identifier, status, user_id, artist_name, due_date_str = self.task
+        tasks_cog = interaction.client.get_cog("Tasks") or self.bot.get_cog("Tasks")
+        if tasks_cog is None:
+            await interaction.response.edit_message(content="❌ The task manager is not available right now.", embed=None, view=None)
+            return
+
+        result, error = await tasks_cog.reassign_task_to_member(interaction, task_id, assignee)
+        if error:
+            await interaction.response.edit_message(content=error, embed=None, view=None)
+            return
+
+        previous_user_mention = f"<@{result['previous_user_id']}>" if result["previous_user_id"] else result["previous_user_name"]
+        if result["status"] == "Completed":
+            description = (
+                f"✅ **Completed task reassigned.**\n"
+                f"**Task:** {result['variant']} {result['sprite_type']} - {result['identifier']}\n"
+                f"**From:** {previous_user_mention}\n"
+                f"**To:** {result['new_user_mention']}\n"
+                f"**Credit:** completion count transferred."
+            )
+        else:
+            description = (
+                f"✅ **Task reassigned.**\n"
+                f"**Task:** {result['variant']} {result['sprite_type']} - {result['identifier']}\n"
+                f"**From:** {previous_user_mention}\n"
+                f"**To:** {result['new_user_mention']}\n"
+                f"**Deadline:** {result['new_due_date'].strftime('%b %d, %Y')}"
+            )
+
+        if result["thread_id"]:
+            if result["status"] == "Completed":
+                forum_message = (
+                    f"This completed task was reassigned from {previous_user_mention} "
+                    f"to {result['new_user_mention']} by {interaction.user.mention}."
+                )
+            else:
+                forum_message = (
+                    f"This task was reassigned from {previous_user_mention} "
+                    f"to {result['new_user_mention']} by {interaction.user.mention}."
+                )
+            await update_task_bundle_forum_status(
+                self.bot,
+                self.db_path,
+                result["thread_id"],
+                forum_message,
+            )
+
+        await interaction.response.edit_message(
+            content=description,
+            embed=None,
+            view=None
+        )
+
+
+class ReassignTaskAssigneeView(discord.ui.View):
+    def __init__(self, bot, db_path: str, task, director_id: int):
+        super().__init__(timeout=300)
+        self.add_item(ReassignTaskAssigneeSelect(bot, db_path, task, director_id))
+
+
+class ReassignTaskSelectView(discord.ui.View):
+    def __init__(self, bot, db_path: str, reassignable_tasks, director_id: int):
+        super().__init__(timeout=300)
+        self.add_item(ReassignTaskSelectDropdown(bot, db_path, reassignable_tasks, director_id))
+
+
 class Tasks(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.db_path = "data/corelet.db"
+        self.task_picker_prompts = {}
+        self.tasks_per_level = 5
         self.ensure_schema()
         # Start the background loop when the cog is loaded
         self.check_deadlines.start() 
 
     def ensure_schema(self):
+        ensure_task_link_columns(self.db_path)
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute("PRAGMA table_info(tasks)")
@@ -1482,6 +2080,27 @@ class Tasks(commands.Cog):
             cursor.execute(query, params)
             return cursor.fetchall()
 
+    def ensure_user_record(self, cursor, user_id: int, discord_name: str):
+        cursor.execute("""
+            INSERT INTO users (user_id, discord_name)
+            VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                discord_name = excluded.discord_name
+        """, (user_id, discord_name))
+
+    def adjust_user_task_total(self, cursor, user_id: int, delta: int, discord_name: str):
+        self.ensure_user_record(cursor, user_id, discord_name)
+        cursor.execute("SELECT tasks_completed FROM users WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        current_completed = int(row[0] or 0) if row else 0
+        new_completed = max(0, current_completed + delta)
+        new_level = (new_completed // self.tasks_per_level) + 1
+        cursor.execute(
+            "UPDATE users SET tasks_completed = ?, level = ? WHERE user_id = ?",
+            (new_completed, new_level, user_id),
+        )
+        return new_completed, new_level
+
     async def require_director(self, interaction: discord.Interaction) -> bool:
         if has_director_role(interaction.user):
             return True
@@ -1500,6 +2119,21 @@ class Tasks(commands.Cog):
         except discord.HTTPException:
             print(f"Could not DM user {user_id}.")
 
+    def remember_task_picker_prompt(self, channel_id: int, user_id: int):
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+        self.task_picker_prompts[(channel_id, user_id)] = expires_at
+
+    def has_active_task_picker_prompt(self, channel_id: int, user_id: int) -> bool:
+        now = datetime.now(timezone.utc)
+        expired_keys = [
+            key for key, expires_at in self.task_picker_prompts.items()
+            if expires_at <= now
+        ]
+        for key in expired_keys:
+            self.task_picker_prompts.pop(key, None)
+
+        return self.task_picker_prompts.pop((channel_id, user_id), None) is not None
+
     def get_thread_available_tasks(self, channel):
         if not isinstance(channel, discord.Thread):
             return []
@@ -1512,6 +2146,124 @@ class Tasks(commands.Cog):
             ORDER BY variant, sprite_type, pokedex_identifier COLLATE NOCASE
             LIMIT 25
         """, (channel.id,))
+
+    def get_reassignable_tasks(self, channel):
+        statuses = ("Assigned", "Waiting For Feedback", "Completed")
+        status_placeholders = ", ".join("?" for _ in statuses)
+        if isinstance(channel, discord.Thread):
+            return self.fetch_query(f"""
+                SELECT t.task_id, t.variant, t.sprite_type, t.pokedex_identifier, t.status, t.user_id,
+                       COALESCE(u.discord_name, 'Unknown User'), t.due_date
+                FROM tasks t
+                LEFT JOIN users u ON t.user_id = u.user_id
+                WHERE t.forum_thread_id = ?
+                  AND t.status IN ({status_placeholders})
+                ORDER BY
+                    CASE t.status
+                        WHEN 'Assigned' THEN 1
+                        WHEN 'Waiting For Feedback' THEN 2
+                        WHEN 'Completed' THEN 3
+                        ELSE 4
+                    END,
+                    t.due_date ASC,
+                    t.variant,
+                    t.sprite_type,
+                    t.pokedex_identifier COLLATE NOCASE
+                LIMIT 25
+            """, (channel.id, *statuses))
+
+        return self.fetch_query(f"""
+            SELECT t.task_id, t.variant, t.sprite_type, t.pokedex_identifier, t.status, t.user_id,
+                   COALESCE(u.discord_name, 'Unknown User'), t.due_date
+            FROM tasks t
+            LEFT JOIN users u ON t.user_id = u.user_id
+            WHERE t.status IN ({status_placeholders})
+            ORDER BY
+                CASE t.status
+                    WHEN 'Assigned' THEN 1
+                    WHEN 'Waiting For Feedback' THEN 2
+                    WHEN 'Completed' THEN 3
+                    ELSE 4
+                END,
+                t.due_date ASC,
+                t.variant,
+                t.sprite_type,
+                t.pokedex_identifier COLLATE NOCASE
+            LIMIT 25
+        """, statuses)
+
+    async def reassign_task_to_member(self, interaction: discord.Interaction, task_id: int, assignee: discord.Member):
+        now = datetime.now(timezone.utc)
+        new_due_date = now + timedelta(days=7)
+
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT t.task_id, t.status, t.user_id, t.variant, t.sprite_type, t.pokedex_identifier,
+                       t.forum_thread_id, t.due_date, t.assigned_date, t.feedback_message_url,
+                       t.completion_message_url, COALESCE(u.discord_name, 'Unknown User')
+                FROM tasks t
+                LEFT JOIN users u ON t.user_id = u.user_id
+                WHERE t.task_id = ?
+            """, (task_id,))
+            task = cursor.fetchone()
+
+            if not task:
+                return None, "❌ That task could not be found."
+
+            (
+                task_id,
+                status,
+                current_user_id,
+                variant,
+                sprite_type,
+                identifier,
+                thread_id,
+                _due_date,
+                _assigned_date,
+                _feedback_message_url,
+                _completion_message_url,
+                current_user_name,
+            ) = task
+
+            if current_user_id is None:
+                return None, "❌ That task does not currently have an assignee to transfer from."
+
+            if current_user_id == assignee.id:
+                return None, f"❌ **{variant} {sprite_type} — {identifier}** is already assigned to {assignee.mention}."
+
+            if status == "Completed":
+                self.adjust_user_task_total(cursor, current_user_id, -1, current_user_name)
+                self.adjust_user_task_total(cursor, assignee.id, 1, getattr(assignee, "display_name", assignee.name))
+                cursor.execute("""
+                    UPDATE tasks
+                    SET user_id = ?
+                    WHERE task_id = ?
+                """, (assignee.id, task_id))
+            else:
+                cursor.execute("""
+                    UPDATE tasks
+                    SET user_id = ?, status = 'Assigned', assigned_date = ?, due_date = ?,
+                        feedback_message_url = NULL, completion_message_url = NULL
+                    WHERE task_id = ?
+                """, (assignee.id, now.isoformat(), new_due_date.isoformat(), task_id))
+
+            conn.commit()
+
+        return {
+            "task_id": task_id,
+            "status": status,
+            "variant": variant,
+            "sprite_type": sprite_type,
+            "identifier": identifier,
+            "thread_id": thread_id,
+            "previous_user_id": current_user_id,
+            "previous_user_name": current_user_name,
+            "new_user_id": assignee.id,
+            "new_user_name": getattr(assignee, "display_name", assignee.name),
+            "new_user_mention": assignee.mention,
+            "new_due_date": new_due_date,
+        }, None
 
     def is_task_request_channel(self, channel) -> bool:
         request_channel_ids = get_task_request_channel_ids()
@@ -1551,13 +2303,138 @@ class Tasks(commands.Cog):
 
         embed = discord.Embed(
             title="Void Dev Task Board",
-            description="Select a category below to claim a new task.",
+            description="Select Spriting, Characters, or Music below, or type one as your next message.",
             color=discord.Color.dark_grey()
         )
+        self.remember_task_picker_prompt(interaction.channel.id, interaction.user.id)
         await interaction.response.send_message(
             embed=embed,
             view=TaskBoardView(self.bot, self.db_path)
         )
+
+    async def send_task_group_picker(self, interaction: discord.Interaction, category_key: str):
+        if isinstance(interaction.channel, discord.Thread):
+            await interaction.response.send_message(
+                "❌ Use this in the task request channel, or use `/taskmenu` inside a task forum thread.",
+                ephemeral=True
+            )
+            return
+
+        if not self.is_task_request_channel(interaction.channel):
+            await interaction.response.send_message(
+                "❌ Use this in the task request channel.",
+                ephemeral=True
+            )
+            return
+
+        groups = fetch_available_task_groups(self.db_path, category_key)
+        category = TASK_BOARD_CATEGORY_OPTIONS[category_key]
+        if not groups:
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    title=category["title"],
+                    description=TASK_BOARD_GROUPS[category_key]["empty_message"],
+                    color=discord.Color.red()
+                ),
+                ephemeral=True
+            )
+            return
+
+        view = AvailableTaskGroupView(self.bot, self.db_path, category_key, groups, interaction.user.id)
+        await interaction.response.send_message(embed=await view.build_embed(), view=view)
+
+    async def claim_available_task(
+        self,
+        interaction: discord.Interaction,
+        user_id: int,
+        user_mention: str,
+        variant: str,
+        sprite_type: str,
+        identifier: Optional[str] = None,
+    ):
+        identifier_clause, identifier_params = build_identifier_search(identifier)
+        thread_clause = ""
+        thread_params = ()
+        if isinstance(interaction.channel, discord.Thread) and not identifier_clause:
+            thread_clause = "AND forum_thread_id = ?"
+            thread_params = (interaction.channel.id,)
+        elif not identifier_clause:
+            await interaction.response.send_message(
+                "❌ Include a Pokemon name or Dex number, or use this inside a task forum thread.",
+                ephemeral=True
+            )
+            return
+
+        now = datetime.now(timezone.utc)
+        due_date = now + timedelta(days=7)
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(f"""
+                    SELECT task_id, pokedex_identifier, status, forum_thread_id, min_level
+                    FROM tasks
+                    WHERE variant = ?
+                      AND sprite_type = ?
+                      AND status IN ('Available', 'Unassigned')
+                      {identifier_clause}
+                      {thread_clause}
+                    ORDER BY pokedex_identifier COLLATE NOCASE
+                    LIMIT 2
+                """, (variant, sprite_type, *identifier_params, *thread_params))
+                matches = cursor.fetchall()
+
+                if not matches:
+                    target = identifier.strip() if identifier else getattr(interaction.channel, "name", "this thread")
+                    await interaction.response.send_message(
+                        f"❌ Could not find an available **{variant} {sprite_type}** task for **{target}**.",
+                        ephemeral=True
+                    )
+                    return
+
+                if len(matches) > 1:
+                    await interaction.response.send_message(
+                        "❌ That matched more than one Pokemon. Use the full `Dex Number - Pokemon Name` format.",
+                        ephemeral=True
+                    )
+                    return
+
+                task_id, matched_identifier, status, thread_id, min_level = matches[0]
+                has_level, user_level = check_user_min_level(cursor, user_id, min_level)
+                if not has_level:
+                    await interaction.response.send_message(
+                        (
+                            f"❌ **{variant} {sprite_type} — {matched_identifier}** requires "
+                            f"**Level {min_level}**. You are currently **Level {user_level}**."
+                        ),
+                        ephemeral=True
+                    )
+                    return
+
+                cursor.execute("""
+                    UPDATE tasks
+                    SET user_id = ?, status = 'Assigned', assigned_date = ?, due_date = ?
+                    WHERE task_id = ?
+                """, (user_id, now.isoformat(), due_date.isoformat(), task_id))
+                conn.commit()
+
+            await update_task_bundle_forum_status(
+                self.bot,
+                self.db_path,
+                thread_id,
+                f"{user_mention} claimed this task. Due: {due_date.strftime('%b %d, %Y')}."
+            )
+
+            await interaction.response.send_message(
+                (
+                    f"✅ Assigned **{variant} {sprite_type} — {matched_identifier}** to {user_mention}.\n"
+                    f"Due: **{due_date.strftime('%b %d, %Y')}**"
+                )
+            )
+        except discord.Forbidden as e:
+            await interaction.response.send_message(discord_access_error_message(e), ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"Database error: {e}", ephemeral=True)
 
     async def send_active_tasks(self, interaction: discord.Interaction):
         try:
@@ -1574,7 +2451,7 @@ class Tasks(commands.Cog):
                 active_tasks,
                 "All Active Tasks",
             )
-            await interaction.response.send_message(embed=view.build_embed(), view=view)
+            await interaction.response.send_message(embed=await view.build_embed(), view=view)
 
         except discord.Forbidden as e:
             await interaction.response.send_message(discord_access_error_message(e), ephemeral=True)
@@ -1582,7 +2459,7 @@ class Tasks(commands.Cog):
             await interaction.response.send_message(f"Database error: {e}", ephemeral=True)
 
 
-    async def assigntask(self, interaction: discord.Interaction, assignee: discord.Member, identifier: str, sprite_type: str, variant: str):
+    async def assign_task_to_member(self, interaction: discord.Interaction, assignee: discord.Member, identifier: str, sprite_type: str, variant: str):
         # NEW: Check if this specific task is already assigned to someone
         existing_task = self.fetch_query("""
             SELECT user_id FROM tasks 
@@ -1615,13 +2492,12 @@ class Tasks(commands.Cog):
                     thread_id = thread.id
                     self.execute_query("UPDATE tasks SET forum_thread_id = ? WHERE task_id = ?", (thread_id, task_id))
 
-            await update_task_forum_status(
+            await update_task_bundle_forum_status(
                 self.bot,
+                self.db_path,
                 thread_id,
-                "Assigned",
                 f"{assignee.mention} was assigned this task. Due: {due_date.strftime('%b %d, %Y')}."
             )
-            await update_task_forum_summary(self.bot, self.db_path, thread_id)
 
             await interaction.response.send_message(f"✅ Assigned **{variant} {sprite_type} {identifier}** to {assignee.mention}. Due by: {due_date.strftime('%Y-%m-%d')}.")
         except discord.Forbidden as e:
@@ -1643,6 +2519,32 @@ class Tasks(commands.Cog):
             embed=embed,
             view=AssignTaskUserView(self.bot, self.db_path, interaction.user.id)
         )
+
+    async def send_reassign_task_menu(self, interaction: discord.Interaction):
+        if not await self.require_director(interaction):
+            return
+
+        reassignable_tasks = self.get_reassignable_tasks(interaction.channel)
+        if not reassignable_tasks:
+            await interaction.response.send_message(
+                "❌ There are no assigned, waiting, or completed tasks available to reassign here.",
+                ephemeral=True
+            )
+            return
+
+        embed = discord.Embed(
+            title="Reassign Task",
+            description="Choose the task first, then pick the new assignee.",
+            color=discord.Color.dark_grey()
+        )
+        await interaction.response.send_message(
+            embed=embed,
+            view=ReassignTaskSelectView(self.bot, self.db_path, reassignable_tasks, interaction.user.id)
+        )
+
+    @app_commands.command(name="reassigntaskmenu", description="Open a menu for reassigning an assigned or completed task")
+    async def reassigntaskmenu(self, interaction: discord.Interaction):
+        await self.send_reassign_task_menu(interaction)
 
     async def addavailabletask(self, interaction: discord.Interaction, identifier: str, sprite_type: str, variant: str):
         if variant in ("Base", "Shiny", "Anomaly"):
@@ -1714,9 +2616,9 @@ class Tasks(commands.Cog):
         self,
         interaction: discord.Interaction,
         task_id: int,
-        name: str | None = None,
-        reference_image: discord.Attachment | None = None,
-        reference_image_url: str | None = None,
+        name: Optional[str] = None,
+        reference_image: Optional[discord.Attachment] = None,
+        reference_image_url: Optional[str] = None,
     ):
         if not await self.require_director(interaction):
             return
@@ -1956,6 +2858,53 @@ class Tasks(commands.Cog):
             embed.set_footer(text="Showing the first 50 available tasks.")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
+    async def send_task_search(self, interaction: discord.Interaction, scope: Optional[str] = None, category: Optional[str] = None):
+        can_do_only, category_key, unknown_terms = normalize_task_search_args(scope, category)
+        if unknown_terms:
+            await interaction.response.send_message(
+                (
+                    "❌ I did not understand: "
+                    f"`{' '.join(unknown_terms)}`. Try `can`, `pokemon`, `character`, `music`, or `other`."
+                ),
+                ephemeral=True
+            )
+            return
+
+        user_level = None
+        if can_do_only:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                user_level = fetch_user_level(cursor, interaction.user.id)
+
+        rows = fetch_available_task_search_rows(self.db_path, category_key, user_level)
+        if not rows:
+            title = "Available Task Search"
+            filters = []
+            if can_do_only:
+                filters.append(f"Level {user_level} or lower")
+            if category_key:
+                filters.append(category_key.title())
+            filter_text = f" matching **{', '.join(filters)}**" if filters else ""
+            await interaction.response.send_message(f"❌ No available tasks found{filter_text}.", ephemeral=True)
+            return
+
+        title_parts = ["Available Tasks"]
+        if category_key:
+            title_parts.append(category_key.title())
+        if can_do_only:
+            title_parts.append(f"You Can Do, Lv {user_level}")
+
+        view = LookForTasksView(
+            self.db_path,
+            interaction.user.id,
+            rows,
+            " - ".join(title_parts),
+            can_do_only,
+            category_key,
+            user_level,
+        )
+        await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
+
     async def send_cancel_task_menu(self, interaction: discord.Interaction):
         is_director = has_director_role(interaction.user)
 
@@ -2066,12 +3015,104 @@ class Tasks(commands.Cog):
     async def viewtasks(self, interaction: discord.Interaction):
         await self.send_active_tasks(interaction)
 
+    @app_commands.command(name="lookfortasks", description="Search available tasks by level and category")
+    @app_commands.describe(
+        scope="Optional: can, pokemon, character, music, other",
+        category="Optional second filter: pokemon, character, music, other",
+    )
+    async def lookfortasks(self, interaction: discord.Interaction, scope: Optional[str] = None, category: Optional[str] = None):
+        await self.send_task_search(interaction, scope, category)
+
     async def opentasks(self, interaction: discord.Interaction):
         await self.send_active_tasks(interaction)
 
     @app_commands.command(name="taskmenu", description="Open the task claim menu for this channel")
     async def taskmenu(self, interaction: discord.Interaction):
         await self.send_task_claim_menu(interaction)
+
+    @app_commands.command(name="spritingtasks", description="Browse available Pokemon spriting tasks")
+    async def spritingtasks(self, interaction: discord.Interaction):
+        await self.send_task_group_picker(interaction, "pokemon_sprite")
+
+    @app_commands.command(name="charactertasks", description="Browse available character tasks")
+    async def charactertasks(self, interaction: discord.Interaction):
+        await self.send_task_group_picker(interaction, "character_sprite")
+
+    @app_commands.command(name="musictasks", description="Browse available music tasks")
+    async def musictasks(self, interaction: discord.Interaction):
+        await self.send_task_group_picker(interaction, "music")
+
+    @app_commands.command(name="assigntask", description="Claim an available Pokemon sprite task")
+    @app_commands.describe(
+        pokemon="Dex number, Pokemon name, or 'Dex - Name'. Optional inside a task forum thread.",
+        sprite="Task shorthand: f, f2, b, sf, sf2, sb, af, af2, ab, or icon.",
+    )
+    async def assigntask(self, interaction: discord.Interaction, pokemon: Optional[str] = None, sprite: Optional[str] = None):
+        if sprite is None and pokemon and parse_pokemon_sprite_alias(pokemon):
+            sprite = pokemon
+            pokemon = None
+
+        if sprite is None:
+            await interaction.response.send_message(
+                "❌ Include a sprite shorthand like `f`, `f2`, `b`, `sf`, `sf2`, `sb`, `af`, `af2`, `ab`, or `icon`.",
+                ephemeral=True
+            )
+            return
+
+        parsed_task = parse_pokemon_sprite_alias(sprite)
+        if parsed_task is None:
+            await interaction.response.send_message(
+                "❌ Unknown sprite shorthand. Try `f`, `f2`, `b`, `sf`, `sf2`, `sb`, `af`, `af2`, `ab`, or `icon`.",
+                ephemeral=True
+            )
+            return
+
+        variant, sprite_type = parsed_task
+        await self.claim_available_task(
+            interaction,
+            interaction.user.id,
+            interaction.user.mention,
+            variant,
+            sprite_type,
+            pokemon,
+        )
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        if message.author.bot or not message.guild:
+            return
+        if isinstance(message.channel, discord.Thread):
+            return
+        if not self.is_task_request_channel(message.channel):
+            return
+        if not self.has_active_task_picker_prompt(message.channel.id, message.author.id):
+            return
+
+        content = message.content.strip().casefold()
+        category_key = None
+        if content in {"spriting", "sprite", "sprites", "pokemon", "pokemon spriting"}:
+            category_key = "pokemon_sprite"
+        elif content in {"character", "characters", "character tasks", "charactertasks"}:
+            category_key = "character_sprite"
+        elif content in {"music", "music tasks", "musictasks"}:
+            category_key = "music"
+
+        if category_key is None:
+            return
+
+        groups = fetch_available_task_groups(self.db_path, category_key)
+        category = TASK_BOARD_CATEGORY_OPTIONS[category_key]
+        if not groups:
+            embed = discord.Embed(
+                title=category["title"],
+                description=TASK_BOARD_GROUPS[category_key]["empty_message"],
+                color=discord.Color.red()
+            )
+            await message.channel.send(embed=embed)
+            return
+
+        view = AvailableTaskGroupView(self.bot, self.db_path, category_key, groups, message.author.id)
+        await message.channel.send(embed=await view.build_embed(), view=view)
 
     async def workingon(self, interaction: discord.Interaction):
         try:
@@ -2167,13 +3208,23 @@ class Tasks(commands.Cog):
 
         try:
             # Update the status in the database
-            self.execute_query("UPDATE tasks SET status = 'Waiting For Feedback' WHERE task_id = ?", (task_id,))
-            await update_task_bundle_forum_status(
+            self.execute_query("""
+                UPDATE tasks
+                SET status = 'Waiting For Feedback', feedback_message_url = NULL
+                WHERE task_id = ?
+            """, (task_id,))
+            status_message = await update_task_bundle_forum_status(
                 self.bot,
                 self.db_path,
                 thread_id,
                 f"{interaction.user.mention} marked this task as Waiting for Feedback."
             )
+            if status_message:
+                self.execute_query(
+                    "UPDATE tasks SET feedback_message_url = ? WHERE task_id = ?",
+                    (status_message.jump_url, task_id),
+                )
+                await update_task_forum_summary(self.bot, self.db_path, thread_id)
             
             await interaction.response.send_message(f"✅ **{variant} {sprite_type} {identifier}** has been marked as **Waiting For Feedback**!")
             
@@ -2242,7 +3293,7 @@ class Tasks(commands.Cog):
 
         embed = discord.Embed(
             title="Void Dev Task Board",
-            description="Select a category below to claim a new task.",
+            description="Select Spriting, Characters, or Music below to claim a new task.",
             color=discord.Color.dark_grey()
         )
         view = TaskBoardView(self.bot, self.db_path)
@@ -2273,9 +3324,130 @@ class AvailableTaskView(discord.ui.View):
 
 
 class ThreadAvailableTaskView(discord.ui.View):
-    def __init__(self, bot, db_path: str, available_tasks):
+    def __init__(self, bot, db_path: str, available_tasks, placeholder: str = "Select a task from this thread..."):
         super().__init__(timeout=300)
-        self.add_item(ThreadAvailableTaskDropdown(bot, db_path, available_tasks))
+        self.add_item(ThreadAvailableTaskDropdown(bot, db_path, available_tasks, placeholder))
+
+
+class AvailableTaskGroupView(discord.ui.View):
+    def __init__(self, bot, db_path: str, category_key: str, groups, requester_id: int, page_size: int = 1):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.db_path = db_path
+        self.category_key = category_key
+        self.groups = groups
+        self.requester_id = requester_id
+        self.page_size = page_size
+        self.page = 0
+        self.thread_reference_cache = {}
+        self.rebuild_items()
+
+    @property
+    def page_count(self) -> int:
+        return max(1, (len(self.groups) + self.page_size - 1) // self.page_size)
+
+    def rebuild_items(self):
+        self.clear_items()
+        if self.page_count > 1:
+            self.add_item(self.previous_page)
+            self.add_item(self.next_page)
+
+    def current_identifier(self):
+        return self.groups[self.page][0]
+
+    async def fetch_thread_reference_image(self, thread_id):
+        if not thread_id:
+            return None
+        if thread_id in self.thread_reference_cache:
+            return self.thread_reference_cache[thread_id]
+
+        reference_image_url = None
+        try:
+            thread = self.bot.get_channel(thread_id) or await self.bot.fetch_channel(thread_id)
+            if isinstance(thread, discord.Thread):
+                starter_message = getattr(thread, "starter_message", None)
+                if starter_message:
+                    reference_image_url = extract_reference_image_from_message(starter_message)
+
+                fetch_message = getattr(thread, "fetch_message", None)
+                if reference_image_url is None and fetch_message:
+                    try:
+                        starter_message = await fetch_message(thread_id)
+                        reference_image_url = extract_reference_image_from_message(starter_message)
+                    except discord.HTTPException:
+                        reference_image_url = None
+
+                parent_fetch_message = getattr(getattr(thread, "parent", None), "fetch_message", None)
+                if reference_image_url is None and parent_fetch_message:
+                    try:
+                        starter_message = await parent_fetch_message(thread_id)
+                        reference_image_url = extract_reference_image_from_message(starter_message)
+                    except discord.HTTPException:
+                        reference_image_url = None
+
+                if reference_image_url is None:
+                    async for message in thread.history(limit=50, oldest_first=True):
+                        reference_image_url = extract_reference_image_from_message(message)
+                        if reference_image_url:
+                            break
+        except discord.HTTPException:
+            reference_image_url = None
+
+        self.thread_reference_cache[thread_id] = reference_image_url
+        return reference_image_url
+
+    async def build_embed(self):
+        identifier = self.current_identifier()
+        task_rows = fetch_task_group_details(self.db_path, self.category_key, identifier)
+        reference_image_url = choose_renderable_reference_image(task_rows)
+        has_expired_reference = (
+            reference_image_url is None
+            and any(is_ephemeral_discord_attachment(row[6]) for row in task_rows if row[6])
+        )
+        thread_id = next((row[7] for row in task_rows if row[7]), None)
+        if reference_image_url is None:
+            reference_image_url = await self.fetch_thread_reference_image(thread_id)
+        if reference_image_url:
+            has_expired_reference = False
+
+        task_lines = build_board_task_lines(self.category_key, task_rows)
+
+        description_parts = ["**Tasks**"]
+        if thread_id:
+            description_parts.append(f"<#{thread_id}>")
+        if has_expired_reference:
+            description_parts.append("*Reference image link expired. Re-add it with a non-ephemeral Discord attachment or image URL.*")
+        description_parts.append("\n".join(task_lines) if task_lines else "No active task rows found.")
+
+        embed = discord.Embed(
+            title=identifier,
+            description="\n".join(description_parts),
+            color=discord.Color.dark_grey()
+        )
+        if reference_image_url:
+            embed.set_image(url=reference_image_url)
+        embed.set_footer(text=f"Next [<] [>] • {self.page + 1}/{len(self.groups)}")
+        return embed
+
+    @discord.ui.button(label="<", style=discord.ButtonStyle.secondary, row=1)
+    async def previous_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("❌ Only the person who opened this picker can use it.", ephemeral=True)
+            return
+
+        self.page = (self.page - 1) % self.page_count
+        self.rebuild_items()
+        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
+
+    @discord.ui.button(label=">", style=discord.ButtonStyle.secondary, row=1)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("❌ Only the person who opened this picker can use it.", ephemeral=True)
+            return
+
+        self.page = (self.page + 1) % self.page_count
+        self.rebuild_items()
+        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
 
 
 class AssignTaskUserView(discord.ui.View):
@@ -2342,6 +3514,96 @@ class CancelTaskView(discord.ui.View):
     def __init__(self, bot, db_path: str, assigned_tasks, is_director: bool):
         super().__init__(timeout=300)
         self.add_item(CancelTaskDropdown(bot, db_path, assigned_tasks, is_director))
+
+
+class LookForTasksView(discord.ui.View):
+    def __init__(
+        self,
+        db_path: str,
+        requester_id: int,
+        rows,
+        title: str,
+        can_do_only: bool,
+        category_key: Optional[str],
+        user_level: Optional[int],
+        page_size: int = 10,
+    ):
+        super().__init__(timeout=300)
+        self.db_path = db_path
+        self.requester_id = requester_id
+        self.rows = rows
+        self.title = title
+        self.can_do_only = can_do_only
+        self.category_key = category_key
+        self.user_level = user_level
+        self.page_size = page_size
+        self.page = 0
+        self.rebuild_items()
+
+    @property
+    def page_count(self) -> int:
+        return max(1, (len(self.rows) + self.page_size - 1) // self.page_size)
+
+    def rebuild_items(self):
+        self.clear_items()
+        if self.page_count > 1:
+            self.add_item(self.previous_page)
+            self.add_item(self.next_page)
+
+    def build_embed(self):
+        embed = discord.Embed(
+            title=self.title,
+            color=discord.Color.dark_grey()
+        )
+
+        filters = []
+        if self.can_do_only:
+            filters.append(f"within your level range: Lv {self.user_level}")
+        if self.category_key:
+            filters.append(f"category: {self.category_key}")
+        embed.description = "Filters: " + ", ".join(filters) if filters else "All available tasks."
+
+        start = self.page * self.page_size
+        end = start + self.page_size
+        for task_id, variant, sprite_type, identifier, min_level, reference_image_url, thread_id in self.rows[start:end]:
+            link_text = f"\n**Forum:** <#{thread_id}>" if thread_id else ""
+            reference_text = ""
+            if reference_image_url and not is_ephemeral_discord_attachment(reference_image_url):
+                reference_text = f"\n**Reference:** [Open image]({reference_image_url})"
+
+            embed.add_field(
+                name=f"{variant} {sprite_type} - {identifier}"[:256],
+                value=(
+                    f"**Task ID:** {task_id}\n"
+                    f"**Minimum Level:** {format_min_level(min_level)}"
+                    f"{link_text}"
+                    f"{reference_text}"
+                ),
+                inline=False,
+            )
+
+        embed.set_footer(text=f"Page {self.page + 1}/{self.page_count} - {len(self.rows)} matching tasks")
+        return embed
+
+    @discord.ui.button(label="<", style=discord.ButtonStyle.secondary)
+    async def previous_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("❌ Only the person who opened this search can use it.", ephemeral=True)
+            return
+
+        self.page = (self.page - 1) % self.page_count
+        self.rebuild_items()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label=">", style=discord.ButtonStyle.secondary)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("❌ Only the person who opened this search can use it.", ephemeral=True)
+            return
+
+        self.page = (self.page + 1) % self.page_count
+        self.rebuild_items()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
 
 class ActiveTasksMemberSelect(discord.ui.UserSelect):
@@ -2480,5 +3742,109 @@ class ActiveTasksView(discord.ui.View):
         self.update_buttons()
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
+
+class SubmitForFeedbackDropdown(discord.ui.Select):
+    def __init__(self, cog: Tasks, message: discord.Message, assigned_tasks):
+        self.cog = cog
+        self.message = message
+        options = [
+            discord.SelectOption(
+                label=f"{variant} {sprite_type} - {identifier}"[:100],
+                value=str(task_id),
+                description="Link this message in the task breakdown",
+            )
+            for task_id, variant, sprite_type, identifier in assigned_tasks
+        ]
+        super().__init__(
+            placeholder="Select the task this message is ready for...",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        task_id = int(self.values[0])
+
+        task = self.cog.fetch_query("""
+            SELECT variant, sprite_type, pokedex_identifier, forum_thread_id
+            FROM tasks
+            WHERE task_id = ? AND user_id = ? AND status = 'Assigned'
+        """, (task_id, interaction.user.id))
+
+        if not task:
+            await interaction.followup.send("❌ That task is no longer assigned to you.", ephemeral=True)
+            return
+
+        variant, sprite_type, identifier, thread_id = task[0]
+        try:
+            self.cog.execute_query("""
+                UPDATE tasks
+                SET status = 'Waiting For Feedback', feedback_message_url = ?
+                WHERE task_id = ?
+            """, (self.message.jump_url, task_id))
+
+            await update_task_bundle_forum_status(
+                self.cog.bot,
+                self.cog.db_path,
+                thread_id,
+                f"{interaction.user.mention} marked this task as Waiting for Feedback: {self.message.jump_url}"
+            )
+            await update_task_forum_summary(self.cog.bot, self.cog.db_path, thread_id)
+
+            await interaction.followup.send(
+                f"✅ **{variant} {sprite_type} — {identifier}** has been marked as **Waiting For Feedback**.",
+                ephemeral=True
+            )
+        except discord.Forbidden as e:
+            await interaction.followup.send(discord_access_error_message(e), ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"Database error: {e}", ephemeral=True)
+
+
+class SubmitForFeedbackView(discord.ui.View):
+    def __init__(self, cog: Tasks, message: discord.Message, assigned_tasks):
+        super().__init__(timeout=300)
+        self.add_item(SubmitForFeedbackDropdown(cog, message, assigned_tasks))
+
+
+async def request_feedback_context_menu(interaction: discord.Interaction, message: discord.Message):
+    if not message.attachments:
+        await interaction.response.send_message("❌ That message has no attachments to submit for feedback.", ephemeral=True)
+        return
+
+    cog = interaction.client.get_cog("Tasks")
+    if cog is None:
+        await interaction.response.send_message("❌ Task tools are not loaded.", ephemeral=True)
+        return
+
+    assigned_tasks = cog.fetch_query("""
+        SELECT task_id, variant, sprite_type, pokedex_identifier
+        FROM tasks
+        WHERE user_id = ? AND status = 'Assigned'
+        ORDER BY due_date ASC
+        LIMIT 25
+    """, (interaction.user.id,))
+
+    if not assigned_tasks:
+        await interaction.response.send_message("❌ You do not have any assigned tasks ready to request feedback for.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="Request Feedback",
+        description="Choose the task this submission should be linked to.",
+        color=discord.Color.dark_grey()
+    )
+    await interaction.response.send_message(
+        embed=embed,
+        view=SubmitForFeedbackView(cog, message, assigned_tasks),
+        ephemeral=True
+    )
+
+
 async def setup(bot):
     await bot.add_cog(Tasks(bot))
+    bot.tree.add_command(app_commands.ContextMenu(
+        name="Request Feedback",
+        callback=request_feedback_context_menu,
+    ))

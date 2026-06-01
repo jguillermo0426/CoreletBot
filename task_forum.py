@@ -48,6 +48,20 @@ STATUS_LABELS = {
 }
 
 
+def ensure_task_link_columns(db_path: str):
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(tasks)")
+        columns = {row[1] for row in cursor.fetchall()}
+
+        if "feedback_message_url" not in columns:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN feedback_message_url TEXT")
+        if "completion_message_url" not in columns:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN completion_message_url TEXT")
+
+        conn.commit()
+
+
 def get_task_forum_id(variant: str, sprite_type: str):
     if variant == "Audio" and sprite_type == "Music":
         forum_id = os.getenv("MUSIC_TASK_FORUM_CHANNEL_ID") or os.getenv("SOUNDS_TASK_FORUM_CHANNEL_ID")
@@ -102,6 +116,14 @@ def format_task_status(status: Optional[str]):
     return STATUS_LABELS.get(status or "Available", status or "Missing")
 
 
+def format_task_message_link(status: Optional[str], feedback_url: Optional[str], completion_url: Optional[str]):
+    if status == "Waiting For Feedback" and feedback_url:
+        return f" {feedback_url}"
+    if status == "Completed" and completion_url:
+        return f" {completion_url}"
+    return ""
+
+
 def build_task_forum_summary(thread_name: str, rows):
     if not rows:
         return (
@@ -112,8 +134,18 @@ def build_task_forum_summary(thread_name: str, rows):
 
     group = get_task_group(rows)
     task_by_type = {
-        (variant, sprite_type): (status, user_id, min_level)
-        for _identifier, variant, sprite_type, status, user_id, min_level, _reference_image_url in rows
+        (variant, sprite_type): (status, user_id, min_level, feedback_url, completion_url)
+        for (
+            _identifier,
+            variant,
+            sprite_type,
+            status,
+            user_id,
+            min_level,
+            _reference_image_url,
+            feedback_url,
+            completion_url,
+        ) in rows
     }
     aggregate_statuses = [row[3] for row in rows]
     reference_image_urls = sorted({row[6] for row in rows if row[6]})
@@ -130,11 +162,15 @@ def build_task_forum_summary(thread_name: str, rows):
     lines = []
     for variant, sprite_type in TASK_SUMMARY_ORDER[group]:
         label = f"{variant} {sprite_type}"
-        status, user_id, min_level = task_by_type.get((variant, sprite_type), (None, None, None))
+        status, user_id, min_level, feedback_url, completion_url = task_by_type.get(
+            (variant, sprite_type),
+            (None, None, None, None, None),
+        )
         status_text = format_task_status(status)
+        message_link = format_task_message_link(status, feedback_url, completion_url)
         min_level_text = f" (Lv {min_level}+)" if min_level else ""
         assignee_text = f" - <@{user_id}>" if user_id else ""
-        lines.append(f"{label}{min_level_text} - {status_text}{assignee_text}")
+        lines.append(f"{label}{min_level_text} - {status_text}{message_link}{assignee_text}")
 
     return (
         f"**Task:** {thread_name}\n"
@@ -150,6 +186,8 @@ async def update_task_forum_summary(bot, db_path: str, thread_id: Optional[int])
     if not thread_id:
         return
 
+    ensure_task_link_columns(db_path)
+
     thread = bot.get_channel(thread_id) or await bot.fetch_channel(thread_id)
     if not isinstance(thread, discord.Thread):
         return
@@ -157,7 +195,8 @@ async def update_task_forum_summary(bot, db_path: str, thread_id: Optional[int])
     with sqlite3.connect(db_path) as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT pokedex_identifier, variant, sprite_type, status, user_id, min_level, reference_image_url
+            SELECT pokedex_identifier, variant, sprite_type, status, user_id, min_level,
+                   reference_image_url, feedback_message_url, completion_message_url
             FROM tasks
             WHERE forum_thread_id = ?
             ORDER BY variant, sprite_type
@@ -233,5 +272,8 @@ async def update_task_forum_status(bot, thread_id: Optional[int], status: str, m
         ]
         await thread.edit(applied_tags=[*kept_tags, status_tag])
 
+    sent_message = None
     if message:
-        await thread.send(message)
+        sent_message = await thread.send(message)
+
+    return sent_message
