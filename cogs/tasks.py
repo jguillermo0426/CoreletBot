@@ -1804,6 +1804,77 @@ class RequestFeedbackDropdown(discord.ui.Select):
             await interaction.response.edit_message(content=f"Database error: {e}", embed=None, view=None)
 
 
+class DirectCompleteDropdown(discord.ui.Select):
+    def __init__(self, bot, db_path: str, tasks, director_id: int):
+        self.bot = bot
+        self.db_path = db_path
+        self.director_id = director_id
+        self.tasks_by_id = {}
+        options = []
+
+        for task_id, variant, sprite_type, identifier, status, artist_name, due_date_str in tasks:
+            task_id = int(task_id)
+            self.tasks_by_id[task_id] = (task_id, variant, sprite_type, identifier)
+            due_text = "No due date"
+            if due_date_str:
+                due_text = datetime.fromisoformat(due_date_str).strftime('%b %d, %Y')
+
+            options.append(discord.SelectOption(
+                label=f"{variant} {sprite_type} - {identifier}"[:100],
+                value=str(task_id),
+                description=f"{status} | {artist_name} | Due {due_text}"[:100],
+            ))
+
+        super().__init__(placeholder="Select a task to mark complete...", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.director_id or not has_director_role(interaction.user):
+            await interaction.response.send_message("❌ Only the Director who opened this menu can use it.", ephemeral=True)
+            return
+
+        task_id = int(self.values[0])
+        if task_id not in self.tasks_by_id:
+            await interaction.response.edit_message(content="❌ That task is no longer available.", embed=None, view=None)
+            return
+
+        tasks_cog = interaction.client.get_cog("Tasks") or self.bot.get_cog("Tasks")
+        if tasks_cog is None:
+            await interaction.response.edit_message(content="❌ The task manager is not available right now.", embed=None, view=None)
+            return
+
+        result, error = await tasks_cog.mark_task_complete_directly(interaction, task_id)
+        if error:
+            await interaction.response.edit_message(content=error, embed=None, view=None)
+            return
+
+        previous_status = result["status"]
+        message = (
+            f"✅ **{result['variant']} {result['sprite_type']} — {result['identifier']}** was marked as **Completed** by {interaction.user.mention}."
+        )
+        if previous_status == "Waiting For Feedback" and result["completion_message_url"]:
+            message += "\nThe original feedback submission was linked as the completion reference."
+
+        if result["thread_id"]:
+            await update_task_bundle_forum_status(
+                self.bot,
+                self.db_path,
+                result["thread_id"],
+                f"{interaction.user.mention} marked this task as Completed without waiting for feedback."
+            )
+
+        await interaction.response.edit_message(
+            content=message,
+            embed=None,
+            view=None
+        )
+
+
+class DirectCompleteView(discord.ui.View):
+    def __init__(self, bot, db_path: str, tasks, director_id: int):
+        super().__init__(timeout=300)
+        self.add_item(DirectCompleteDropdown(bot, db_path, tasks, director_id))
+
+
 class CancelTaskDropdown(discord.ui.Select):
     def __init__(self, bot, db_path: str, assigned_tasks, is_director: bool):
         self.bot = bot
@@ -2190,6 +2261,49 @@ class Tasks(commands.Cog):
                 t.sprite_type,
                 t.pokedex_identifier COLLATE NOCASE
             LIMIT 25
+            """, statuses)
+
+    def get_direct_complete_tasks(self, channel):
+        statuses = ("Assigned", "Waiting For Feedback")
+        status_placeholders = ", ".join("?" for _ in statuses)
+        if isinstance(channel, discord.Thread):
+            return self.fetch_query(f"""
+                SELECT t.task_id, t.variant, t.sprite_type, t.pokedex_identifier, t.status,
+                       COALESCE(u.discord_name, 'Unknown User'), t.due_date
+                FROM tasks t
+                LEFT JOIN users u ON t.user_id = u.user_id
+                WHERE t.forum_thread_id = ?
+                  AND t.status IN ({status_placeholders})
+                ORDER BY
+                    CASE t.status
+                        WHEN 'Waiting For Feedback' THEN 1
+                        WHEN 'Assigned' THEN 2
+                        ELSE 3
+                    END,
+                    t.due_date ASC,
+                    t.variant,
+                    t.sprite_type,
+                    t.pokedex_identifier COLLATE NOCASE
+                LIMIT 25
+            """, (channel.id, *statuses))
+
+        return self.fetch_query(f"""
+            SELECT t.task_id, t.variant, t.sprite_type, t.pokedex_identifier, t.status,
+                   COALESCE(u.discord_name, 'Unknown User'), t.due_date
+            FROM tasks t
+            LEFT JOIN users u ON t.user_id = u.user_id
+            WHERE t.status IN ({status_placeholders})
+            ORDER BY
+                CASE t.status
+                    WHEN 'Waiting For Feedback' THEN 1
+                    WHEN 'Assigned' THEN 2
+                    ELSE 3
+                END,
+                t.due_date ASC,
+                t.variant,
+                t.sprite_type,
+                t.pokedex_identifier COLLATE NOCASE
+            LIMIT 25
         """, statuses)
 
     async def reassign_task_to_member(self, interaction: discord.Interaction, task_id: int, assignee: discord.Member):
@@ -2263,6 +2377,68 @@ class Tasks(commands.Cog):
             "new_user_name": getattr(assignee, "display_name", assignee.name),
             "new_user_mention": assignee.mention,
             "new_due_date": new_due_date,
+        }, None
+
+    async def mark_task_complete_directly(self, interaction: discord.Interaction, task_id: int):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT t.task_id, t.status, t.user_id, t.variant, t.sprite_type, t.pokedex_identifier,
+                       t.forum_thread_id, t.feedback_message_url, COALESCE(u.discord_name, 'Unknown User')
+                FROM tasks t
+                LEFT JOIN users u ON t.user_id = u.user_id
+                WHERE t.task_id = ?
+            """, (task_id,))
+            task = cursor.fetchone()
+
+            if not task:
+                return None, "❌ That task could not be found."
+
+            (
+                task_id,
+                status,
+                user_id,
+                variant,
+                sprite_type,
+                identifier,
+                thread_id,
+                feedback_message_url,
+                current_user_name,
+            ) = task
+
+            if status not in ("Assigned", "Waiting For Feedback"):
+                return None, f"❌ **{variant} {sprite_type} — {identifier}** is not in a state that can be marked complete."
+
+            if user_id is None:
+                return None, f"❌ **{variant} {sprite_type} — {identifier}** does not have an assignee yet."
+
+            completion_message_url = feedback_message_url
+            cursor.execute("""
+                UPDATE tasks
+                SET status = 'Completed',
+                    completion_message_url = ?
+                WHERE task_id = ?
+            """, (completion_message_url, task_id))
+
+            self.adjust_user_task_total(
+                cursor,
+                user_id,
+                1,
+                current_user_name,
+            )
+
+            conn.commit()
+
+        return {
+            "task_id": task_id,
+            "variant": variant,
+            "sprite_type": sprite_type,
+            "identifier": identifier,
+            "thread_id": thread_id,
+            "status": status,
+            "user_id": user_id,
+            "user_name": current_user_name,
+            "completion_message_url": completion_message_url,
         }, None
 
     def is_task_request_channel(self, channel) -> bool:
@@ -2545,6 +2721,32 @@ class Tasks(commands.Cog):
     @app_commands.command(name="reassigntaskmenu", description="Open a menu for reassigning an assigned or completed task")
     async def reassigntaskmenu(self, interaction: discord.Interaction):
         await self.send_reassign_task_menu(interaction)
+
+    async def send_direct_complete_menu(self, interaction: discord.Interaction):
+        if not await self.require_director(interaction):
+            return
+
+        direct_complete_tasks = self.get_direct_complete_tasks(interaction.channel)
+        if not direct_complete_tasks:
+            await interaction.response.send_message(
+                "❌ There are no assigned or waiting tasks available to mark complete here.",
+                ephemeral=True
+            )
+            return
+
+        embed = discord.Embed(
+            title="Mark Task Complete",
+            description="Choose a task to mark complete without waiting for feedback.",
+            color=discord.Color.dark_grey()
+        )
+        await interaction.response.send_message(
+            embed=embed,
+            view=DirectCompleteView(self.bot, self.db_path, direct_complete_tasks, interaction.user.id)
+        )
+
+    @app_commands.command(name="completetaskmenu", description="Open a menu for marking a task complete without waiting for feedback")
+    async def completetaskmenu(self, interaction: discord.Interaction):
+        await self.send_direct_complete_menu(interaction)
 
     async def addavailabletask(self, interaction: discord.Interaction, identifier: str, sprite_type: str, variant: str):
         if variant in ("Base", "Shiny", "Anomaly"):
