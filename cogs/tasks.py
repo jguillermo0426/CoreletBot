@@ -218,6 +218,18 @@ def normalize_task_search_args(scope: Optional[str], category: Optional[str]):
     return can_do_only, category_key, unknown_terms
 
 
+def normalize_assignment_slot_label(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
+
+
+def split_assignment_mapping_line(line: str):
+    for separator in ("=>", "->", "=", ":"):
+        if separator in line:
+            left, right = line.split(separator, 1)
+            return left.strip(), right.strip()
+    return None, None
+
+
 def fetch_available_task_search_rows(db_path: str, category_key: Optional[str], user_level: Optional[int]):
     clauses = ["status IN ('Available', 'Unassigned')"]
     params = []
@@ -1214,6 +1226,38 @@ class AssignThreadAssigneeView(discord.ui.View):
         )
 
 
+class BulkAssignForumTasksModal(discord.ui.Modal):
+    def __init__(self, bot, db_path: str, director_id: int):
+        super().__init__(title="Bulk Assign Forum Tasks")
+        self.bot = bot
+        self.db_path = db_path
+        self.director_id = director_id
+        self.assignments_input = discord.ui.TextInput(
+            label="Assignments",
+            style=discord.TextStyle.paragraph,
+            placeholder=(
+                "Base Front = @person_a\n"
+                "Base Front 2 = @person_b\n"
+                "Base Back = @person_c"
+            ),
+            required=True,
+            max_length=4000,
+        )
+        self.add_item(self.assignments_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.user.id != self.director_id or not has_director_role(interaction.user):
+            await interaction.response.send_message("❌ Only the Director who opened this modal can use it.", ephemeral=True)
+            return
+
+        tasks_cog = interaction.client.get_cog("Tasks") or self.bot.get_cog("Tasks")
+        if tasks_cog is None:
+            await interaction.response.send_message("❌ The task manager is not available right now.", ephemeral=True)
+            return
+
+        await tasks_cog.bulk_assign_tasks_in_thread(interaction, self.assignments_input.value)
+
+
 class AddTaskCategoryDropdown(discord.ui.Select):
     def __init__(self, bot, db_path: str):
         self.bot = bot
@@ -2175,6 +2219,15 @@ class Tasks(commands.Cog):
             LIMIT 25
         """, (channel.id,))
 
+    def get_thread_assignable_tasks(self, thread_id: int):
+        return self.fetch_query("""
+            SELECT task_id, variant, sprite_type, pokedex_identifier, min_level
+            FROM tasks
+            WHERE forum_thread_id = ?
+              AND status IN ('Available', 'Unassigned')
+            ORDER BY variant, sprite_type, pokedex_identifier COLLATE NOCASE
+        """, (thread_id,))
+
     def get_reassignable_tasks(self, channel):
         statuses = ("Assigned", "Waiting For Feedback", "Completed")
         status_placeholders = ", ".join("?" for _ in statuses)
@@ -2692,6 +2745,216 @@ class Tasks(commands.Cog):
         except Exception as e:
             await interaction.edit_original_response(content=f"Database error: {e}", embed=None, view=None)
 
+    async def bulk_assign_tasks_in_thread(self, interaction: discord.Interaction, mapping_text: str):
+        if not isinstance(interaction.channel, discord.Thread):
+            await interaction.response.send_message(
+                "❌ Use this command inside a task forum thread.",
+                ephemeral=True,
+            )
+            return
+
+        thread_id = interaction.channel.id
+        available_tasks = self.get_thread_assignable_tasks(thread_id)
+        if not available_tasks:
+            await interaction.response.send_message(
+                "❌ There are no available tasks in this thread.",
+                ephemeral=True,
+            )
+            return
+
+        slot_lookup = {}
+        for task_id, variant, sprite_type, identifier, min_level in available_tasks:
+            slot_key = normalize_assignment_slot_label(f"{variant} {sprite_type}")
+            slot_lookup[slot_key] = {
+                "task_id": int(task_id),
+                "variant": variant,
+                "sprite_type": sprite_type,
+                "identifier": identifier,
+                "min_level": min_level,
+                "display": f"{variant} {sprite_type} — {identifier}",
+            }
+
+        raw_lines = [line.strip() for line in (mapping_text or "").splitlines() if line.strip()]
+        if not raw_lines:
+            await interaction.response.send_message(
+                "❌ Paste one assignment per line, like `Base Front = @person`.",
+                ephemeral=True,
+            )
+            return
+
+        planned_assignments = {}
+        line_errors = []
+        available_labels = [slot["display"] for slot in slot_lookup.values()]
+
+        for line_number, line in enumerate(raw_lines, start=1):
+            label_text, assignee_text = split_assignment_mapping_line(line)
+            if label_text is None or assignee_text is None:
+                line_errors.append(
+                    f"Line {line_number}: use `Task = @member`."
+                )
+                continue
+
+            slot_key = normalize_assignment_slot_label(label_text)
+            if slot_key in planned_assignments:
+                line_errors.append(
+                    f"Line {line_number}: duplicate assignment for `{label_text.strip()}`."
+                )
+                continue
+
+            slot = slot_lookup.get(slot_key)
+            if slot is None:
+                line_errors.append(
+                    f"Line {line_number}: `{label_text.strip()}` does not match an available task."
+                )
+                continue
+
+            member_match = re.fullmatch(r"<@!?(\d+)>", assignee_text.strip()) or re.fullmatch(r"(\d+)", assignee_text.strip())
+            if not member_match:
+                line_errors.append(
+                    f"Line {line_number}: use a Discord mention or user ID for the assignee."
+                )
+                continue
+
+            member_id = int(member_match.group(1))
+            member = interaction.guild.get_member(member_id) if interaction.guild else None
+            if member is None and interaction.guild is not None:
+                try:
+                    member = await interaction.guild.fetch_member(member_id)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    member = None
+
+            if member is None:
+                line_errors.append(
+                    f"Line {line_number}: could not find a guild member for `{assignee_text.strip()}`."
+                )
+                continue
+
+            planned_assignments[slot_key] = {
+                "line_number": line_number,
+                "member": member,
+                "slot": slot,
+            }
+
+        missing_slots = [slot for key, slot in slot_lookup.items() if key not in planned_assignments]
+        if line_errors or missing_slots:
+            description_lines = ["❌ I couldn't apply that mapping."]
+            if line_errors:
+                description_lines.append("")
+                description_lines.append("Problems:")
+                for message in line_errors[:10]:
+                    description_lines.append(f"- {message}")
+                if len(line_errors) > 10:
+                    description_lines.append(f"- ...and {len(line_errors) - 10} more")
+            if missing_slots:
+                description_lines.append("")
+                description_lines.append("Missing assignments:")
+                for slot in missing_slots[:10]:
+                    description_lines.append(f"- {slot['display']}")
+                if len(missing_slots) > 10:
+                    description_lines.append(f"- ...and {len(missing_slots) - 10} more")
+            if available_labels:
+                description_lines.append("")
+                description_lines.append("Available slots:")
+                for label in available_labels[:10]:
+                    description_lines.append(f"- {label}")
+                if len(available_labels) > 10:
+                    description_lines.append(f"- ...and {len(available_labels) - 10} more")
+
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    title="Bulk Assign Tasks",
+                    description="\n".join(description_lines),
+                    color=discord.Color.red(),
+                ),
+                ephemeral=True,
+            )
+            return
+
+        now = datetime.now(timezone.utc)
+        due_date = now + timedelta(days=7)
+        member_level_cache = {}
+        assigned_rows = []
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                for slot_key, assignment in planned_assignments.items():
+                    member = assignment["member"]
+                    slot = assignment["slot"]
+
+                    cached_level = member_level_cache.get(member.id)
+                    if cached_level is None:
+                        has_level, user_level = check_user_min_level(cursor, member.id, slot["min_level"])
+                        member_level_cache[member.id] = (has_level, user_level)
+                    else:
+                        has_level, user_level = cached_level
+
+                    if not has_level:
+                        await interaction.response.send_message(
+                            embed=discord.Embed(
+                                title="Bulk Assign Tasks",
+                                description=(
+                                    f"❌ **{member.mention}** is **Level {user_level}**, but "
+                                    f"**{slot['display']}** requires **Level {slot['min_level']}**."
+                                ),
+                                color=discord.Color.red(),
+                            ),
+                            ephemeral=True,
+                        )
+                        return
+
+                    cursor.execute("""
+                        UPDATE tasks
+                        SET user_id = ?, status = 'Assigned', assigned_date = ?, due_date = ?
+                        WHERE task_id = ?
+                    """, (member.id, now.isoformat(), due_date.isoformat(), slot["task_id"]))
+                    assigned_rows.append((slot["variant"], slot["sprite_type"], slot["identifier"], member))
+
+                conn.commit()
+
+            forum_message_lines = [
+                f"{interaction.user.mention} bulk assigned the forum tasks:",
+            ]
+            for variant, sprite_type, identifier, member in assigned_rows:
+                forum_message_lines.append(f"- **{variant} {sprite_type} — {identifier}** -> {member.mention}")
+
+            forum_warning = None
+            try:
+                await update_task_bundle_forum_status(
+                    self.bot,
+                    self.db_path,
+                    thread_id,
+                    "\n".join(forum_message_lines),
+                )
+            except discord.Forbidden as e:
+                forum_warning = discord_access_error_message(e)
+            except Exception as e:
+                forum_warning = f"Could not update the forum summary: {e}"
+
+            summary_lines = [
+                f"✅ Assigned **{len(assigned_rows)}** task{'s' if len(assigned_rows) != 1 else ''} in this thread.",
+                "",
+                "Assignments:",
+            ]
+            for variant, sprite_type, identifier, member in assigned_rows:
+                summary_lines.append(f"- {variant} {sprite_type} — {identifier} -> {member.mention}")
+            if forum_warning:
+                summary_lines.append("")
+                summary_lines.append(f"Warning: {forum_warning}")
+
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    title="Bulk Assign Tasks",
+                    description="\n".join(summary_lines),
+                    color=discord.Color.green(),
+                ),
+                ephemeral=True,
+            )
+        except discord.Forbidden as e:
+            await interaction.response.send_message(discord_access_error_message(e), ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"Database error: {e}", ephemeral=True)
+
     async def send_active_tasks(self, interaction: discord.Interaction):
         try:
             active_tasks = fetch_active_task_rows(self.db_path)
@@ -2760,6 +3023,28 @@ class Tasks(commands.Cog):
             await interaction.response.send_message(discord_access_error_message(e), ephemeral=True)
         except Exception as e:
             await interaction.response.send_message(f"Database error: {e}", ephemeral=True)
+
+    @app_commands.command(name="assignforumtasks", description="Bulk assign tasks in the current forum thread")
+    async def assignforumtasks(self, interaction: discord.Interaction):
+        if not await self.require_director(interaction):
+            return
+
+        if not isinstance(interaction.channel, discord.Thread):
+            await interaction.response.send_message(
+                "❌ Use this command inside a task forum thread.",
+                ephemeral=True,
+            )
+            return
+
+        available_tasks = self.get_thread_assignable_tasks(interaction.channel.id)
+        if not available_tasks:
+            await interaction.response.send_message(
+                "❌ There are no available tasks in this thread.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_modal(BulkAssignForumTasksModal(self.bot, self.db_path, interaction.user.id))
 
     @app_commands.command(name="assigntaskmenu", description="Open a menu for assigning an available task")
     async def assigntaskmenu(self, interaction: discord.Interaction):
