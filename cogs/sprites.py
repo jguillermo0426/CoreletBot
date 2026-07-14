@@ -2,6 +2,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 import os
+import re
 import sqlite3
 import gspread
 from googleapiclient.discovery import build
@@ -82,6 +83,31 @@ CHARACTER_ARTIST_COLUMNS = {
     "Overworld": 6,
 }
 
+SUBMISSION_SLOT_ALIASES = {
+    "base front": ("Base", "Front"),
+    "base front 2": ("Base", "Front 2"),
+    "base frame 2": ("Base", "Front 2"),
+    "frame 2": ("Base", "Front 2"),
+    "front 2": ("Base", "Front 2"),
+    "base back": ("Base", "Back"),
+    "base icon": ("Base", "Icon"),
+    "icon": ("Base", "Icon"),
+    "shiny front": ("Shiny", "Front"),
+    "shiny front 2": ("Shiny", "Front 2"),
+    "shiny frame 2": ("Shiny", "Front 2"),
+    "shiny back": ("Shiny", "Back"),
+    "anomaly front": ("Anomaly", "Front"),
+    "anomaly front 2": ("Anomaly", "Front 2"),
+    "anomaly frame 2": ("Anomaly", "Front 2"),
+    "anomaly back": ("Anomaly", "Back"),
+    "character design": ("Character", "Design"),
+    "design": ("Character", "Design"),
+    "character battler": ("Character", "Battler"),
+    "battler": ("Character", "Battler"),
+    "character overworld": ("Character", "Overworld"),
+    "overworld": ("Character", "Overworld"),
+}
+
 
 def split_pokemon_identifier(identifier: str):
     identifier = str(identifier)
@@ -94,6 +120,32 @@ def split_pokemon_identifier(identifier: str):
 
 def sheet_text(value):
     return "" if value is None else str(value).strip()
+
+
+def normalize_submission_label(value: str):
+    return re.sub(r"[^a-z0-9]+", " ", (value or "").casefold()).strip()
+
+
+def parse_submission_slot_label(value: str):
+    return SUBMISSION_SLOT_ALIASES.get(normalize_submission_label(value))
+
+
+def extract_message_image_url(message: discord.Message):
+    for attachment in message.attachments:
+        content_type = attachment.content_type or ""
+        filename = attachment.filename.casefold()
+        if content_type.startswith("image/") or filename.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+            return attachment.url
+
+    for embed in message.embeds:
+        image_url = getattr(getattr(embed, "image", None), "url", None)
+        if image_url:
+            return image_url
+        thumbnail_url = getattr(getattr(embed, "thumbnail", None), "url", None)
+        if thumbnail_url:
+            return thumbnail_url
+
+    return None
 
 
 async def update_task_bundle_forum_status(bot, db_path: str, thread_id, message=None):
@@ -200,6 +252,20 @@ class Sprites(commands.Cog):
         if variant == "Character":
             return "character"
         return "pokemon"
+
+    def find_forum_task_by_slot(self, thread_id: int, variant: str, sprite_type: str, required_statuses=("Waiting For Feedback", "Assigned")):
+        placeholders = ",".join("?" for _ in required_statuses)
+        rows = self.fetch_query(f"""
+            SELECT pokedex_identifier, user_id, task_id
+            FROM tasks
+            WHERE forum_thread_id = ?
+              AND variant = ?
+              AND sprite_type = ?
+              AND status IN ({placeholders})
+            ORDER BY task_id ASC
+            LIMIT 1
+        """, (thread_id, variant, sprite_type, *required_statuses))
+        return rows[0] if rows else None
 
     def get_or_create_completed_worksheet(self, variant: str):
         title = COMPLETED_TASK_SHEETS[self.get_task_sheet_group(variant)]
@@ -536,12 +602,22 @@ class Sprites(commands.Cog):
         artist_name = user_data[0][0] if user_data else f"Unknown User ({user_id})"
 
         try:
-            if not message.attachments:
-                await interaction.followup.send("❌ The selected message does not contain any attachments.")
+            image_url = extract_message_image_url(message)
+            if not image_url:
+                await interaction.followup.send("❌ The selected message does not contain an image attachment or embedded image.")
                 return
-            
-            attachment = message.attachments[0]
-            if self.is_image_attachment(attachment):
+
+            attachment = next(
+                (
+                    candidate
+                    for candidate in message.attachments
+                    if (candidate.content_type or "").startswith("image/")
+                    or candidate.filename.casefold().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))
+                ),
+                None,
+            )
+
+            if attachment is not None:
                 permanent_file_url, upload_error = await self.upload_image_to_imgbb(attachment.url)
                 sheet_file_value = f'=IMAGE("{permanent_file_url}")' if permanent_file_url else None
                 drive_file_url, drive_upload_error, drive_destination = await self.upload_attachment_to_drive(attachment, identifier, sprite_type, variant)
@@ -549,8 +625,9 @@ class Sprites(commands.Cog):
                 if drive_upload_error:
                     print(f"Drive copy failed for image attachment: {drive_upload_error}")
             else:
-                permanent_file_url, upload_error, upload_destination = await self.upload_attachment_to_drive(attachment, identifier, sprite_type, variant)
-                sheet_file_value = permanent_file_url
+                permanent_file_url, upload_error = await self.upload_image_to_imgbb(image_url)
+                sheet_file_value = f'=IMAGE("{permanent_file_url}")' if permanent_file_url else None
+                upload_destination = "ImgBB"
 
             if upload_error:
                 await interaction.followup.send(f"❌ {upload_error}")
@@ -685,14 +762,33 @@ async def accept_submission_context_menu(interaction: discord.Interaction, messa
         await interaction.response.send_message("❌ You do not have the required role to use this action.", ephemeral=True)
         return
 
-    if not message.attachments:
-        await interaction.response.send_message("❌ That message has no attachments to accept.", ephemeral=True)
-        return
-
     cog = interaction.client.get_cog("Sprites")
     if cog is None:
         await interaction.response.send_message("❌ Submission tools are not loaded.", ephemeral=True)
         return
+
+    thread = message.channel if isinstance(message.channel, discord.Thread) else None
+    if thread is not None:
+        slot = parse_submission_slot_label(message.content)
+        if slot is not None:
+            variant, sprite_type = slot
+            matched_task = cog.find_forum_task_by_slot(
+                thread.id,
+                variant,
+                sprite_type,
+            )
+            if matched_task:
+                identifier, _user_id, _task_id = matched_task
+                await interaction.response.defer(ephemeral=True)
+                await cog.finalize_submission(
+                    interaction,
+                    message,
+                    identifier,
+                    sprite_type,
+                    variant,
+                    required_statuses=("Assigned", "Waiting For Feedback",),
+                )
+                return
 
     waiting_tasks = cog.fetch_query("""
         SELECT t.task_id, t.variant, t.sprite_type, t.pokedex_identifier, COALESCE(u.discord_name, 'Unknown User')
@@ -704,7 +800,7 @@ async def accept_submission_context_menu(interaction: discord.Interaction, messa
     """)
 
     if not waiting_tasks:
-        await interaction.response.send_message("❌ No tasks are currently waiting for feedback.", ephemeral=True)
+        await interaction.response.send_message("❌ No tasks are currently waiting for feedback, and this message did not match a labeled forum task.", ephemeral=True)
         return
 
     embed = discord.Embed(

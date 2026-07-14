@@ -2,6 +2,10 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 import sqlite3
+from typing import Optional
+
+def has_director_role(user: discord.Member) -> bool:
+    return any(role.name == "Directors 🌇" for role in getattr(user, "roles", []))
 
 class Profiles(commands.Cog):
     def __init__(self, bot):
@@ -22,13 +26,37 @@ class Profiles(commands.Cog):
             return cursor.fetchall()
         
     @app_commands.command(name="register", description="Register a Void Dev profile")
-    @app_commands.checks.has_role("Directors 🌇")
     @app_commands.describe(
-        member="The Discord member to register",
+        member="Optional: the Discord member to register. If omitted, registers yourself.",
         pronouns="The member's preferred pronouns",
         timezone="The member's timezone (e.g., EST, UTC+2)"
     )
-    async def register(self, interaction: discord.Interaction, member: discord.Member, pronouns: str, timezone: str):
+    async def register(
+        self,
+        interaction: discord.Interaction,
+        member: Optional[discord.Member] = None,
+        pronouns: Optional[str] = None,
+        timezone: Optional[str] = None,
+    ):
+        if member is None:
+            member = interaction.user
+        elif member.id != interaction.user.id and not has_director_role(interaction.user):
+            await interaction.response.send_message(
+                "❌ Only Directors can register other members. You can register yourself without the `member` option.",
+                ephemeral=True
+            )
+            return
+
+        pronouns = pronouns.strip() if pronouns else ""
+        timezone = timezone.strip() if timezone else ""
+
+        if not pronouns or not timezone:
+            await interaction.response.send_message(
+                "❌ Please include both pronouns and timezone.",
+                ephemeral=True
+            )
+            return
+
         user_id = member.id
         discord_name = member.display_name
 
@@ -54,13 +82,6 @@ class Profiles(commands.Cog):
 
     @register.error
     async def register_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
-        if isinstance(error, app_commands.MissingRole):
-            await interaction.response.send_message(
-                "❌ Only Directors can register profiles.",
-                ephemeral=True
-            )
-            return
-
         raise error
 
 async def setup(bot):

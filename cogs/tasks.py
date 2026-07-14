@@ -2451,6 +2451,68 @@ class Tasks(commands.Cog):
             "completion_message_url": completion_message_url,
         }, None
 
+    async def reset_completed_task(self, interaction: discord.Interaction, task_id: int):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT t.task_id, t.status, t.user_id, t.variant, t.sprite_type, t.pokedex_identifier,
+                       t.forum_thread_id, t.feedback_message_url, t.completion_message_url,
+                       COALESCE(u.discord_name, 'Unknown User')
+                FROM tasks t
+                LEFT JOIN users u ON t.user_id = u.user_id
+                WHERE t.task_id = ?
+            """, (task_id,))
+            task = cursor.fetchone()
+
+            if not task:
+                return None, "❌ That task could not be found."
+
+            (
+                task_id,
+                status,
+                user_id,
+                variant,
+                sprite_type,
+                identifier,
+                thread_id,
+                feedback_message_url,
+                completion_message_url,
+                current_user_name,
+            ) = task
+
+            if status != "Completed":
+                return None, f"❌ **{variant} {sprite_type} — {identifier}** is not completed, so it cannot be reset."
+
+            if user_id is None:
+                return None, f"❌ **{variant} {sprite_type} — {identifier}** does not have an assignee to reset from."
+
+            self.adjust_user_task_total(cursor, user_id, -1, current_user_name)
+            cursor.execute("""
+                UPDATE tasks
+                SET status = 'Unassigned',
+                    user_id = NULL,
+                    assigned_date = NULL,
+                    due_date = NULL,
+                    feedback_message_url = NULL,
+                    completion_message_url = NULL
+                WHERE task_id = ?
+            """, (task_id,))
+
+            conn.commit()
+
+        return {
+            "task_id": task_id,
+            "variant": variant,
+            "sprite_type": sprite_type,
+            "identifier": identifier,
+            "thread_id": thread_id,
+            "status": status,
+            "user_id": user_id,
+            "user_name": current_user_name,
+            "feedback_message_url": feedback_message_url,
+            "completion_message_url": completion_message_url,
+        }, None
+
     def is_task_request_channel(self, channel) -> bool:
         request_channel_ids = get_task_request_channel_ids()
         if not request_channel_ids:
@@ -3132,6 +3194,37 @@ class Tasks(commands.Cog):
     @app_commands.command(name="completetaskmenu", description="Open a menu for marking a task complete without waiting for feedback")
     async def completetaskmenu(self, interaction: discord.Interaction):
         await self.send_direct_complete_menu(interaction)
+
+    @app_commands.command(name="resettask", description="Reset a completed task back to unassigned")
+    @app_commands.describe(
+        task_id="The completed task ID to reset back to unassigned",
+    )
+    async def resettask(self, interaction: discord.Interaction, task_id: int):
+        if not await self.require_director(interaction):
+            return
+
+        result, error = await self.reset_completed_task(interaction, task_id)
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
+            return
+
+        previous_user_mention = f"<@{result['user_id']}>" if result["user_id"] else result["user_name"]
+        if result["thread_id"]:
+            await update_task_bundle_forum_status(
+                self.bot,
+                self.db_path,
+                result["thread_id"],
+                f"{interaction.user.mention} reset this completed task back to Missing."
+            )
+
+        await interaction.response.send_message(
+            (
+                f"✅ **{result['variant']} {result['sprite_type']} — {result['identifier']}** was reset from **Completed** to **Unassigned**.\n"
+                f"**Previous assignee:** {previous_user_mention}\n"
+                f"**Completion credit:** removed."
+            ),
+            ephemeral=True,
+        )
 
     async def addavailabletask(self, interaction: discord.Interaction, identifier: str, sprite_type: str, variant: str):
         if variant in ("Base", "Shiny", "Anomaly"):
