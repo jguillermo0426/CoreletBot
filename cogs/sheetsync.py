@@ -117,6 +117,8 @@ class SheetSync(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.db_path = "data/corelet.db"
+        self.last_db_mtime = None
+        self.pending_sync_task = None
         
         # --- Google Sheets Authentication ---
         try:
@@ -141,6 +143,9 @@ class SheetSync(commands.Cog):
         except Exception as e:
             print(f"Failed to connect for Data Sync: {e}")
             self.gc = None
+
+        # Start watching the SQLite database file for changes to auto-sync
+        self.db_file_watcher.start()
 
     def ensure_schema(self):
         with sqlite3.connect(self.db_path) as conn:
@@ -431,34 +436,65 @@ class SheetSync(commands.Cog):
         except Exception as e:
             return False, str(e)
 
-    @app_commands.command(name="syncdata", description="Forcefully sync the database to Google Sheets")
+    @app_commands.command(name="dbtosheets", description="Forcefully sync the database to Google Sheets (overwrites Sheets)")
     @app_commands.checks.has_role("Directors 🌇")
-    async def syncdata(self, interaction: discord.Interaction):
-        await self.send_sync_result(interaction)
-
-    @app_commands.command(name="syncsheets", description="Forcefully sync the database to Google Sheets")
-    @app_commands.checks.has_role("Directors 🌇")
-    async def syncsheets(self, interaction: discord.Interaction):
-        await self.send_sync_result(interaction)
-
-    async def send_sync_result(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True) # Hide this message from the public chat
-        
+    async def dbtosheets(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         success, message = await self.perform_sync()
-        
         if success:
-            await interaction.followup.send("✅ Successfully synced profiles plus split active/completed task sheets!")
+            await interaction.followup.send("✅ Successfully synced database to Google Sheets!")
         else:
             await interaction.followup.send(f"❌ Sync failed: {message}")
 
-    async def importprofiles(self, interaction: discord.Interaction):
+    @app_commands.command(name="sheetstodb", description="Forcefully sync Google Sheets profiles to the database (overwrites DB)")
+    @app_commands.checks.has_role("Directors 🌇")
+    async def sheetstodb(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        if self.gc is None:
-            await interaction.followup.send("❌ Google Sheets API is not connected.")
+        success, message = await self.perform_import()
+        if success:
+            await interaction.followup.send(f"✅ {message}")
+        else:
+            await interaction.followup.send(f"❌ Sync failed: {message}")
+
+    @commands.command(name="dbtosheets", aliases=["db2sheets", "syncsheets", "syncdata", "sync"])
+    async def prefix_dbtosheets(self, ctx: commands.Context):
+        is_director = False
+        if isinstance(ctx.author, discord.Member):
+            is_director = any(role.name == "Directors 🌇" for role in ctx.author.roles)
+        
+        if not is_director:
+            await ctx.reply("❌ You do not have the required role to run this command.")
             return
 
+        msg = await ctx.reply("⏳ Syncing database to Google Sheets...")
+        success, message = await self.perform_sync()
+        if success:
+            await msg.edit(content="✅ Successfully synced database to Google Sheets!")
+        else:
+            await msg.edit(content=f"❌ Sync failed: {message}")
+
+    @commands.command(name="sheetstodb", aliases=["sheets2db", "importprofiles", "importsheets"])
+    async def prefix_sheetstodb(self, ctx: commands.Context):
+        is_director = False
+        if isinstance(ctx.author, discord.Member):
+            is_director = any(role.name == "Directors 🌇" for role in ctx.author.roles)
+        
+        if not is_director:
+            await ctx.reply("❌ You do not have the required role to run this command.")
+            return
+
+        msg = await ctx.reply("⏳ Syncing Google Sheets profiles to the database...")
+        success, message = await self.perform_import()
+        if success:
+            await msg.edit(content=f"✅ {message}")
+        else:
+            await msg.edit(content=f"❌ Sync failed: {message}")
+
+    async def perform_import(self) -> tuple[bool, str]:
+        if self.gc is None:
+            return False, "Google Sheets API is not connected."
+
         try:
-            # get_all_records() reads the sheet and treats the first row as dictionary keys
             records = self.profiles_sheet.get_all_records()
 
             with sqlite3.connect(self.db_path) as conn:
@@ -474,12 +510,19 @@ class SheetSync(commands.Cog):
                         UPDATE users
                         SET discord_name = ?, pronouns = ?, timezone = ?, level = ?, tasks_completed = ?
                         WHERE user_id = ?
-                    """, (row.get("Discord Name"), row.get("Pronouns"), row.get("Timezone"), row.get("Level"), row.get("Tasks Completed"), int(user_id_str)))
+                    """, (
+                        row.get("Discord Name"),
+                        row.get("Pronouns"),
+                        row.get("Timezone"),
+                        row.get("Level"),
+                        row.get("Tasks Completed"),
+                        int(user_id_str)
+                    ))
                     updated_count += cursor.rowcount
                 conn.commit()
-            await interaction.followup.send(f"✅ Successfully updated {updated_count} profiles from Google Sheets!")
+            return True, f"Successfully updated {updated_count} profiles from Google Sheets!"
         except Exception as e:
-            await interaction.followup.send(f"❌ Failed to import from sheets: {e}")
+            return False, str(e)
 
     # --- Automatic Background Loop ---
     @tasks.loop(hours=12)
@@ -492,6 +535,58 @@ class SheetSync(commands.Cog):
     @auto_sync.before_loop
     async def before_auto_sync(self):
         await self.bot.wait_until_ready()
+
+    # --- Automatic File Watcher Loop ---
+    @tasks.loop(seconds=5)
+    async def db_file_watcher(self):
+        if self.gc is None:
+            return
+        if not os.path.exists(self.db_path):
+            return
+        
+        try:
+            mtime = os.path.getmtime(self.db_path)
+        except Exception:
+            return
+        
+        # If this is the first run, initialize self.last_db_mtime
+        if self.last_db_mtime is None:
+            self.last_db_mtime = mtime
+            return
+        
+        # If mtime has changed, trigger a debounced sync
+        if mtime != self.last_db_mtime:
+            print(f"Database modification detected (mtime changed from {self.last_db_mtime} to {mtime}). Scheduling sync...")
+            self.last_db_mtime = mtime
+            self.schedule_sync()
+
+    @db_file_watcher.before_loop
+    async def before_db_file_watcher(self):
+        await self.bot.wait_until_ready()
+
+    def schedule_sync(self):
+        """Schedule a database-to-sheets sync to run after a brief delay, debouncing multiple requests."""
+        import asyncio
+        if self.pending_sync_task:
+            self.pending_sync_task.cancel()
+        
+        async def _delayed_sync():
+            await asyncio.sleep(5)  # wait 5 seconds before running sync to let multiple updates settle
+            print("Running scheduled database-to-sheets sync...")
+            success, message = await self.perform_sync()
+            if success:
+                print("Scheduled database-to-sheets sync completed successfully.")
+            else:
+                print(f"Scheduled database-to-sheets sync failed: {message}")
+            self.pending_sync_task = None
+        
+        self.pending_sync_task = asyncio.create_task(_delayed_sync())
+
+    def cog_unload(self):
+        self.auto_sync.cancel()
+        self.db_file_watcher.cancel()
+        if self.pending_sync_task:
+            self.pending_sync_task.cancel()
 
 async def setup(bot):
     await bot.add_cog(SheetSync(bot))
