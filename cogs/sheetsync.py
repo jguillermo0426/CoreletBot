@@ -6,6 +6,7 @@ import sqlite3
 import gspread
 from gspread.exceptions import APIError, WorksheetNotFound
 from google_auth import get_google_credentials
+from task_forum import update_task_forum_summary
 
 TASK_SHEET_CONFIGS = {
     "pokemon": {
@@ -499,6 +500,7 @@ class SheetSync(commands.Cog):
         try:
             # --- 1. Import Profiles ---
             profile_records = self.profiles_sheet.get_all_records()
+            updated_threads = set()
 
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
@@ -599,10 +601,22 @@ class SheetSync(commands.Cog):
                         if task_id_str.isdigit():
                             task_id = int(task_id_str)
                             # Check if task already exists
-                            cursor.execute("SELECT 1 FROM tasks WHERE task_id = ?", (task_id,))
-                            exists = cursor.fetchone()
+                            cursor.execute("SELECT pokedex_identifier, forum_thread_id FROM tasks WHERE task_id = ?", (task_id,))
+                            row_db = cursor.fetchone()
                             
-                            if exists:
+                            if row_db:
+                                old_identifier, thread_id = row_db
+                                # If the name changed, rename the thread on Discord
+                                if old_identifier != identifier and thread_id and thread_id not in updated_threads:
+                                    try:
+                                        thread = self.bot.get_channel(thread_id) or await self.bot.fetch_channel(thread_id)
+                                        if isinstance(thread, discord.Thread) and thread.name != identifier:
+                                            await thread.edit(name=identifier[:100])
+                                            await update_task_forum_summary(self.bot, self.db_path, thread_id)
+                                        updated_threads.add(thread_id)
+                                    except Exception as e:
+                                        print(f"Failed to rename thread {thread_id} to {identifier}: {e}")
+
                                 cursor.execute("""
                                     UPDATE tasks SET
                                         user_id = ?,
