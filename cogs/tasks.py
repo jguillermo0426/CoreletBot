@@ -4079,6 +4079,14 @@ class Tasks(commands.Cog):
         errors = []
 
         try:
+            # Fetch active threads for the guild once
+            guild_active_threads = []
+            try:
+                active_threads_payload = await interaction.guild.fetch_active_threads()
+                guild_active_threads = active_threads_payload.threads
+            except Exception as e:
+                errors.append(f"Error fetching active threads for the guild: {e}")
+
             # Connect to DB and fetch tasks
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
@@ -4093,13 +4101,8 @@ class Tasks(commands.Cog):
                     if not isinstance(channel, discord.ForumChannel):
                         continue
 
-                    # Fetch active threads
-                    try:
-                        active_threads_payload = await channel.fetch_active_threads()
-                        threads = list(active_threads_payload.threads)
-                    except Exception as e:
-                        errors.append(f"Error fetching active threads for {channel.name}: {e}")
-                        threads = []
+                    # Filter guild active threads for this channel
+                    threads = [t for t in guild_active_threads if t.parent_id == cid]
 
                     # Fetch archived threads
                     try:
