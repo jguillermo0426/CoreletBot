@@ -4082,8 +4082,7 @@ class Tasks(commands.Cog):
             # Fetch active threads for the guild once
             guild_active_threads = []
             try:
-                active_threads_payload = await interaction.guild.fetch_active_threads()
-                guild_active_threads = active_threads_payload.threads
+                guild_active_threads = await interaction.guild.active_threads()
             except Exception as e:
                 errors.append(f"Error fetching active threads for the guild: {e}")
 
