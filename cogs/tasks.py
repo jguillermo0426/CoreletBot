@@ -2117,6 +2117,411 @@ class ReassignTaskSelectView(discord.ui.View):
         self.add_item(ReassignTaskSelectDropdown(bot, db_path, reassignable_tasks, director_id))
 
 
+class EditTaskSelectDropdown(discord.ui.Select):
+    def __init__(self, bot, db_path: str, task_ids_list, current_task_id: int, director_id: int):
+        self.bot = bot
+        self.db_path = db_path
+        self.task_ids_list = task_ids_list
+        self.current_task_id = current_task_id
+        self.director_id = director_id
+
+        options = []
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            for tid in task_ids_list:
+                cursor.execute("""
+                    SELECT variant, sprite_type, pokedex_identifier, status
+                    FROM tasks WHERE task_id = ?
+                """, (tid,))
+                row = cursor.fetchone()
+                if row:
+                    var, stype, name, status = row
+                    label = f"{var} {stype} ({status})"
+                    label = label[:95]
+                    description = f"ID: {tid} - {name}"[:95]
+                    options.append(discord.SelectOption(
+                        label=label,
+                        value=str(tid),
+                        description=description,
+                        default=(tid == current_task_id)
+                    ))
+
+        super().__init__(
+            placeholder="Select a task to edit...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=0
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.director_id or not has_director_role(interaction.user):
+            await interaction.response.send_message("❌ Only the Director who opened this menu can use it.", ephemeral=True)
+            return
+
+        selected_id = int(self.values[0])
+        self.view.current_task_id = selected_id
+        await self.view.refresh_message(interaction)
+
+
+class EditTaskStatusDropdown(discord.ui.Select):
+    def __init__(self, bot, db_path: str, current_status: str, director_id: int):
+        self.bot = bot
+        self.db_path = db_path
+        self.director_id = director_id
+
+        statuses = ["Available", "Unassigned", "Assigned", "Waiting For Feedback", "Completed"]
+        options = []
+        for s in statuses:
+            options.append(discord.SelectOption(
+                label=s,
+                value=s,
+                default=(s == current_status)
+            ))
+
+        super().__init__(
+            placeholder="Change task status...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=1
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.director_id or not has_director_role(interaction.user):
+            await interaction.response.send_message("❌ Only the Director who opened this menu can use it.", ephemeral=True)
+            return
+
+        new_status = self.values[0]
+        task_id = self.view.current_task_id
+
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT variant, sprite_type, pokedex_identifier, user_id, forum_thread_id FROM tasks WHERE task_id = ?", (task_id,))
+            task = cursor.fetchone()
+            if not task:
+                await interaction.response.send_message("❌ Task not found.", ephemeral=True)
+                return
+            
+            variant, sprite_type, name, old_user_id, thread_id = task
+            
+            if new_status in ["Available", "Unassigned"]:
+                cursor.execute("""
+                    UPDATE tasks
+                    SET status = ?, user_id = NULL, assigned_date = NULL, due_date = NULL,
+                        feedback_message_url = NULL, completion_message_url = NULL
+                    WHERE task_id = ?
+                """, (new_status, task_id))
+            else:
+                cursor.execute("UPDATE tasks SET status = ? WHERE task_id = ?", (new_status, task_id))
+            
+            conn.commit()
+
+        if thread_id:
+            msg = f"Task **{variant} {sprite_type}** status updated to **{new_status}** by {interaction.user.mention}."
+            await update_task_bundle_forum_status(self.bot, self.db_path, thread_id, msg)
+            await update_task_forum_summary(self.bot, self.db_path, thread_id)
+
+        await self.view.refresh_message(interaction, feedback=f"✅ Status updated to **{new_status}**.")
+
+
+class EditTaskAssigneeSelect(discord.ui.UserSelect):
+    def __init__(self, bot, db_path: str, director_id: int):
+        self.bot = bot
+        self.db_path = db_path
+        self.director_id = director_id
+        super().__init__(
+            placeholder="Select a new assignee...",
+            min_values=1,
+            max_values=1,
+            row=2
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.director_id or not has_director_role(interaction.user):
+            await interaction.response.send_message("❌ Only the Director who opened this menu can use it.", ephemeral=True)
+            return
+
+        assignee = self.values[0]
+        task_id = self.view.current_task_id
+        
+        now = datetime.now(timezone.utc)
+        due_date = now + timedelta(days=7)
+
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT variant, sprite_type, pokedex_identifier, status, forum_thread_id, min_level FROM tasks WHERE task_id = ?", (task_id,))
+            task = cursor.fetchone()
+            if not task:
+                await interaction.response.send_message("❌ Task not found.", ephemeral=True)
+                return
+            
+            variant, sprite_type, name, status, thread_id, min_level = task
+            
+            if min_level:
+                has_level, user_level = check_user_min_level(cursor, assignee.id, min_level)
+                if not has_level:
+                    await interaction.response.send_message(
+                        f"❌ {assignee.mention} is Level {user_level}, but this task requires Level {min_level}.",
+                        ephemeral=True
+                    )
+                    return
+
+            cursor.execute("""
+                UPDATE tasks
+                SET user_id = ?, status = 'Assigned', assigned_date = ?, due_date = ?
+                WHERE task_id = ?
+            """, (assignee.id, now.isoformat(), due_date.isoformat(), task_id))
+            conn.commit()
+
+        if thread_id:
+            msg = f"{assignee.mention} was assigned **{variant} {sprite_type}** by {interaction.user.mention}. Due: {due_date.strftime('%b %d, %Y')}."
+            await update_task_bundle_forum_status(self.bot, self.db_path, thread_id, msg)
+            await update_task_forum_summary(self.bot, self.db_path, thread_id)
+
+        await self.view.refresh_message(interaction, feedback=f"✅ Assigned to {assignee.mention}.")
+
+
+class EditTaskModal(discord.ui.Modal):
+    def __init__(self, bot, db_path: str, task_id: int, current_name: str, current_level: str, current_ref: str, view_to_refresh):
+        super().__init__(title="Edit Task Details")
+        self.bot = bot
+        self.db_path = db_path
+        self.task_id = task_id
+        self.view_to_refresh = view_to_refresh
+
+        self.name_input = discord.ui.TextInput(
+            label="Task Name / Pokedex ID",
+            default=current_name,
+            required=True,
+            max_length=200
+        )
+        self.level_input = discord.ui.TextInput(
+            label="Minimum Level Required",
+            default=current_level,
+            required=False,
+            max_length=10,
+            placeholder="e.g. 1"
+        )
+        self.ref_input = discord.ui.TextInput(
+            label="Reference Image URL",
+            default=current_ref,
+            required=False,
+            max_length=1000,
+            placeholder="Image URL or 'none' to clear"
+        )
+        self.add_item(self.name_input)
+        self.add_item(self.level_input)
+        self.add_item(self.ref_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        new_name = self.name_input.value.strip()
+        new_level_str = self.level_input.value.strip()
+        new_ref = self.ref_input.value.strip()
+
+        if not new_name:
+            await interaction.response.send_message("❌ Task name cannot be empty.", ephemeral=True)
+            return
+
+        level_val = None
+        if new_level_str:
+            try:
+                level_val = int(new_level_str)
+            except ValueError:
+                await interaction.response.send_message("❌ Minimum level must be a valid number.", ephemeral=True)
+                return
+
+        ref_val = new_ref
+        if new_ref.casefold() in {"clear", "remove", "none", ""}:
+            ref_val = None
+        elif new_ref:
+            ref_val = normalize_reference_image_url(new_ref)
+
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT variant, sprite_type, pokedex_identifier, forum_thread_id FROM tasks WHERE task_id = ?", (self.task_id,))
+            task = cursor.fetchone()
+            if not task:
+                await interaction.response.send_message("❌ Task not found.", ephemeral=True)
+                return
+            
+            variant, sprite_type, old_name, thread_id = task
+            
+            if new_name != old_name and thread_id:
+                cursor.execute("""
+                    UPDATE tasks
+                    SET pokedex_identifier = ?, min_level = ?, reference_image_url = ?
+                    WHERE forum_thread_id = ? AND pokedex_identifier = ?
+                """, (new_name, level_val, ref_val, thread_id, old_name))
+            else:
+                cursor.execute("""
+                    UPDATE tasks
+                    SET pokedex_identifier = ?, min_level = ?, reference_image_url = ?
+                    WHERE task_id = ?
+                """, (new_name, level_val, ref_val, self.task_id))
+            
+            conn.commit()
+
+        if new_name != old_name and thread_id:
+            try:
+                thread = self.bot.get_channel(thread_id) or await self.bot.fetch_channel(thread_id)
+                if isinstance(thread, discord.Thread):
+                    await thread.edit(name=new_name[:100])
+            except Exception:
+                pass
+
+        if thread_id:
+            await update_task_forum_summary(self.bot, self.db_path, thread_id)
+
+        await self.view_to_refresh.refresh_message(interaction, feedback="✅ Task details updated.")
+
+
+class EditTaskView(discord.ui.View):
+    def __init__(self, bot, db_path: str, task_ids: list[int], current_task_id: int, director_id: int):
+        super().__init__(timeout=600)
+        self.bot = bot
+        self.db_path = db_path
+        self.task_ids = task_ids
+        self.current_task_id = current_task_id
+        self.director_id = director_id
+        self.setup_components()
+
+    def setup_components(self):
+        self.clear_items()
+
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT status FROM tasks WHERE task_id = ?", (self.current_task_id,))
+            row = cursor.fetchone()
+            status = row[0] if row else "Available"
+
+        if len(self.task_ids) > 1:
+            self.add_item(EditTaskSelectDropdown(self.bot, self.db_path, self.task_ids, self.current_task_id, self.director_id))
+
+        self.add_item(EditTaskStatusDropdown(self.bot, self.db_path, status, self.director_id))
+        self.add_item(EditTaskAssigneeSelect(self.bot, self.db_path, self.director_id))
+
+        edit_details_btn = discord.ui.Button(label="Edit Name & Details", style=discord.ButtonStyle.primary, custom_id="btn_edit_details", row=3)
+        edit_details_btn.callback = self.on_edit_details
+        self.add_item(edit_details_btn)
+
+        unassign_btn = discord.ui.Button(label="Unassign Artist", style=discord.ButtonStyle.secondary, custom_id="btn_unassign", row=3)
+        unassign_btn.callback = self.on_unassign
+        self.add_item(unassign_btn)
+
+        close_btn = discord.ui.Button(label="Close Editor", style=discord.ButtonStyle.danger, custom_id="btn_close", row=3)
+        close_btn.callback = self.on_close
+        self.add_item(close_btn)
+
+    async def build_embed(self, channel_mention: str) -> discord.Embed:
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT variant, sprite_type, pokedex_identifier, status, min_level, reference_image_url, user_id
+                FROM tasks WHERE task_id = ?
+            """, (self.current_task_id,))
+            row = cursor.fetchone()
+            if not row:
+                return discord.Embed(title="Error", description="Task not found.", color=discord.Color.red())
+
+            variant, sprite_type, name, status, min_level, ref_url, artist_id = row
+
+            artist_mention = "None"
+            if artist_id:
+                artist_mention = f"<@{artist_id}>"
+
+            embed = discord.Embed(
+                title=f"Task Editor: {variant} {sprite_type}",
+                description=f"Editing task **#{self.current_task_id}** in {channel_mention}.",
+                color=discord.Color.blue()
+            )
+            embed.add_field(name="Task ID", value=str(self.current_task_id), inline=True)
+            embed.add_field(name="Name / ID", value=name, inline=True)
+            embed.add_field(name="Status", value=status, inline=True)
+            embed.add_field(name="Assignee", value=artist_mention, inline=True)
+            embed.add_field(name="Min Level", value=str(min_level or "None"), inline=True)
+            embed.add_field(name="Reference Image", value=f"[Link]({ref_url})" if ref_url else "None", inline=True)
+            
+            if ref_url:
+                embed.set_thumbnail(url=ref_url)
+
+            return embed
+
+    async def refresh_message(self, interaction: discord.Interaction, feedback: str = None):
+        self.setup_components()
+        embed = await self.build_embed(interaction.channel.mention)
+        if feedback:
+            embed.add_field(name="Last Action", value=feedback, inline=False)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    async def on_edit_details(self, interaction: discord.Interaction):
+        if interaction.user.id != self.director_id or not has_director_role(interaction.user):
+            await interaction.response.send_message("❌ Only the Director who opened this menu can use it.", ephemeral=True)
+            return
+
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT pokedex_identifier, min_level, reference_image_url FROM tasks WHERE task_id = ?", (self.current_task_id,))
+            row = cursor.fetchone()
+            name, min_level, ref_url = row if row else ("", "", "")
+
+        modal = EditTaskModal(
+            self.bot,
+            self.db_path,
+            self.current_task_id,
+            name,
+            str(min_level or ""),
+            ref_url or "",
+            self
+        )
+        await interaction.response.send_modal(modal)
+
+    async def on_unassign(self, interaction: discord.Interaction):
+        if interaction.user.id != self.director_id or not has_director_role(interaction.user):
+            await interaction.response.send_message("❌ Only the Director who opened this menu can use it.", ephemeral=True)
+            return
+
+        task_id = self.current_task_id
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT variant, sprite_type, pokedex_identifier, user_id, forum_thread_id FROM tasks WHERE task_id = ?", (task_id,))
+            task = cursor.fetchone()
+            if not task:
+                await interaction.response.send_message("❌ Task not found.", ephemeral=True)
+                return
+            
+            variant, sprite_type, name, artist_id, thread_id = task
+            
+            if not artist_id:
+                await interaction.response.send_message("⚠️ This task is already unassigned.", ephemeral=True)
+                return
+
+            cursor.execute("""
+                UPDATE tasks
+                SET user_id = NULL, status = 'Unassigned', assigned_date = NULL, due_date = NULL,
+                    feedback_message_url = NULL, completion_message_url = NULL
+                WHERE task_id = ?
+            """, (task_id,))
+            conn.commit()
+
+        if thread_id:
+            msg = f"Task **{variant} {sprite_type}** was unassigned by {interaction.user.mention}."
+            await update_task_bundle_forum_status(self.bot, self.db_path, thread_id, msg)
+            await update_task_forum_summary(self.bot, self.db_path, thread_id)
+
+        await self.refresh_message(interaction, feedback="✅ Artist unassigned.")
+
+    async def on_close(self, interaction: discord.Interaction):
+        if interaction.user.id != self.director_id or not has_director_role(interaction.user):
+            await interaction.response.send_message("❌ Only the Director who opened this menu can use it.", ephemeral=True)
+            return
+
+        await interaction.response.edit_message(content="🚪 Task Editor closed.", embed=None, view=None)
+        self.stop()
+
+
 class Tasks(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -3285,23 +3690,91 @@ class Tasks(commands.Cog):
             view=AddTaskCategoryView(self.bot, self.db_path)
         )
 
-    @app_commands.command(name="edittask", description="Edit a task name or reference image")
+    @app_commands.command(name="edittask", description="Edit a task visually or by ID")
     @app_commands.describe(
-        task_id="The task ID from /tasks or the active task sheet",
-        name="New task name. For bundled forum tasks, this renames the whole bundle.",
-        reference_image="Optional image attachment to use as the reference",
-        reference_image_url="Optional image URL. Use clear/remove/none to remove the reference.",
+        task_id="Optional: The task ID from /tasks or the active task sheet. If omitted, uses current thread.",
+        name="Optional: New task name. For bundled forum tasks, this renames the whole bundle.",
+        reference_image="Optional: Direct image attachment to use as the reference",
+        reference_image_url="Optional: Direct image URL. Use clear/remove/none to remove the reference.",
     )
     async def edittask(
         self,
         interaction: discord.Interaction,
-        task_id: int,
+        task_id: Optional[int] = None,
         name: Optional[str] = None,
         reference_image: Optional[discord.Attachment] = None,
         reference_image_url: Optional[str] = None,
     ):
         if not await self.require_director(interaction):
             return
+
+        is_interactive = (name is None and reference_image is None and reference_image_url is None)
+
+        if is_interactive:
+            task_ids_list = []
+            target_task_id = task_id
+            
+            if target_task_id is None:
+                if not isinstance(interaction.channel, discord.Thread):
+                    await interaction.response.send_message(
+                        "❌ Run this command inside a task forum thread, or provide a specific Task ID.",
+                        ephemeral=True
+                    )
+                    return
+                
+                with sqlite3.connect(self.db_path) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT task_id FROM tasks WHERE forum_thread_id = ?", (interaction.channel.id,))
+                    rows = cursor.fetchall()
+                    if not rows:
+                        await interaction.response.send_message(
+                            "❌ This channel/thread is not mapped to any tasks.",
+                            ephemeral=True
+                        )
+                        return
+                    task_ids_list = [row[0] for row in rows]
+                    target_task_id = task_ids_list[0]
+            else:
+                with sqlite3.connect(self.db_path) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT forum_thread_id FROM tasks WHERE task_id = ?", (target_task_id,))
+                    row = cursor.fetchone()
+                    if not row:
+                        await interaction.response.send_message("❌ Task not found.", ephemeral=True)
+                        return
+                    thread_id = row[0]
+                    if thread_id:
+                        cursor.execute("SELECT task_id FROM tasks WHERE forum_thread_id = ?", (thread_id,))
+                        task_ids_list = [r[0] for r in cursor.fetchall()]
+                    else:
+                        task_ids_list = [target_task_id]
+
+            view = EditTaskView(self.bot, self.db_path, task_ids_list, target_task_id, interaction.user.id)
+            embed = await view.build_embed(interaction.channel.mention)
+            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+            return
+
+        # Direct edit flow:
+        target_task_id = task_id
+        if target_task_id is None:
+            if not isinstance(interaction.channel, discord.Thread):
+                await interaction.response.send_message(
+                    "❌ Run this command inside a task forum thread, or provide a specific Task ID.",
+                    ephemeral=True
+                )
+                return
+            
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT task_id FROM tasks WHERE forum_thread_id = ? LIMIT 1", (interaction.channel.id,))
+                row = cursor.fetchone()
+                if not row:
+                    await interaction.response.send_message(
+                        "❌ This channel/thread is not mapped to any tasks.",
+                        ephemeral=True
+                    )
+                    return
+                target_task_id = row[0]
 
         new_name = name.strip() if name else None
         if name is not None and not new_name:
@@ -3342,7 +3815,7 @@ class Tasks(commands.Cog):
                     SELECT variant, sprite_type, pokedex_identifier, forum_thread_id
                     FROM tasks
                     WHERE task_id = ?
-                """, (task_id,))
+                """, (target_task_id,))
                 task = cursor.fetchone()
 
                 if not task:
@@ -3367,7 +3840,7 @@ class Tasks(commands.Cog):
                         WHERE forum_thread_id = ? AND pokedex_identifier = ?
                     """, tuple(params))
                 else:
-                    params.append(task_id)
+                    params.append(target_task_id)
                     cursor.execute(f"""
                         UPDATE tasks
                         SET {", ".join(set_clauses)}
