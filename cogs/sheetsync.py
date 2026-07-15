@@ -447,7 +447,7 @@ class SheetSync(commands.Cog):
         else:
             await interaction.followup.send(f"❌ Sync failed: {message}")
 
-    @app_commands.command(name="sheetstodb", description="Forcefully sync Google Sheets profiles to the database (overwrites DB)")
+    @app_commands.command(name="sheetstodb", description="Forcefully sync Google Sheets profiles and tasks to the database (overwrites DB)")
     @app_commands.checks.has_role("Directors 🌇")
     async def sheetstodb(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -484,7 +484,7 @@ class SheetSync(commands.Cog):
             await ctx.reply("❌ You do not have the required role to run this command.")
             return
 
-        msg = await ctx.reply("⏳ Syncing Google Sheets profiles to the database...")
+        msg = await ctx.reply("⏳ Syncing Google Sheets profiles and tasks to the database...")
         success, message = await self.perform_import()
         if success:
             await msg.edit(content=f"✅ {message}")
@@ -497,12 +497,15 @@ class SheetSync(commands.Cog):
 
         self._ignore_watcher = True
         try:
-            records = self.profiles_sheet.get_all_records()
+            # --- 1. Import Profiles ---
+            profile_records = self.profiles_sheet.get_all_records()
 
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
-                updated_count = 0
-                for row in records:
+                
+                # Import Profiles
+                updated_profiles_count = 0
+                for row in profile_records:
                     user_id_str = str(row.get("Discord ID", ""))
                     if not user_id_str.isdigit():
                         continue
@@ -517,7 +520,6 @@ class SheetSync(commands.Cog):
                     except (ValueError, TypeError):
                         tasks_completed = 0
 
-                    # Insert or update the user in the database
                     cursor.execute("""
                         INSERT INTO users (user_id, discord_name, pronouns, timezone, level, tasks_completed)
                         VALUES (?, ?, ?, ?, ?, ?)
@@ -535,16 +537,111 @@ class SheetSync(commands.Cog):
                         level,
                         tasks_completed
                     ))
-                    updated_count += cursor.rowcount
+                    updated_profiles_count += cursor.rowcount
+
+                # Commit profiles import so we can lookup users correctly by name for tasks
                 conn.commit()
-            
+
+                # Cache of users to map discord_name to user_id
+                cursor.execute("SELECT user_id, discord_name FROM users")
+                user_cache = {r[1].strip().lower(): r[0] for r in cursor.fetchall() if r[1]}
+
+                # --- 2. Import Active Tasks ---
+                imported_tasks_count = 0
+                skipped_tasks_count = 0
+                
+                for sheet_key, config in TASK_SHEET_CONFIGS.items():
+                    active_sheet_title = config["active"]
+                    try:
+                        worksheet = self.spreadsheet.worksheet(active_sheet_title)
+                        task_records = worksheet.get_all_records()
+                    except WorksheetNotFound:
+                        # If worksheet doesn't exist, we skip it
+                        continue
+                    
+                    for row in task_records:
+                        task_id_str = str(row.get("Task ID", "")).strip()
+                        artist_name = str(row.get("Assigned Artist", "")).strip()
+                        identifier = str(row.get("Task", "")).strip()
+                        sprite_type = str(row.get("Type", "")).strip()
+                        variant = str(row.get("Variant", "")).strip()
+                        status = str(row.get("Status", "")).strip()
+                        assigned_date = str(row.get("Assigned Date", "")).strip()
+                        due_date = str(row.get("Due Date", "")).strip()
+                        min_level_val = row.get("Minimum Level")
+                        reference_image_url = str(row.get("Reference Image", "")).strip()
+
+                        # We need at least identifier, type, and variant to have a valid task
+                        if not identifier or not sprite_type or not variant:
+                            skipped_tasks_count += 1
+                            continue
+
+                        # Resolve artist to user_id
+                        user_id = None
+                        if artist_name and artist_name.lower() != "unassigned":
+                            user_id = user_cache.get(artist_name.lower())
+
+                        # Parse min_level
+                        min_level = None
+                        if min_level_val not in (None, ""):
+                            try:
+                                min_level = int(min_level_val)
+                            except (ValueError, TypeError):
+                                pass
+
+                        # Standardize dates
+                        assigned_date_val = assigned_date if assigned_date else None
+                        due_date_val = due_date if due_date else None
+                        ref_image_val = reference_image_url if reference_image_url else None
+                        status_val = status if status else "Assigned"
+
+                        # Check if task_id is specified
+                        if task_id_str.isdigit():
+                            task_id = int(task_id_str)
+                            # Check if task already exists
+                            cursor.execute("SELECT 1 FROM tasks WHERE task_id = ?", (task_id,))
+                            exists = cursor.fetchone()
+                            
+                            if exists:
+                                cursor.execute("""
+                                    UPDATE tasks SET
+                                        user_id = ?,
+                                        sprite_type = ?,
+                                        variant = ?,
+                                        pokedex_identifier = ?,
+                                        status = ?,
+                                        assigned_date = ?,
+                                        due_date = ?,
+                                        min_level = ?,
+                                        reference_image_url = ?
+                                    WHERE task_id = ?
+                                """, (user_id, sprite_type, variant, identifier, status_val, assigned_date_val, due_date_val, min_level, ref_image_val, task_id))
+                            else:
+                                cursor.execute("""
+                                    INSERT INTO tasks (task_id, user_id, sprite_type, variant, pokedex_identifier, status, assigned_date, due_date, min_level, reference_image_url)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """, (task_id, user_id, sprite_type, variant, identifier, status_val, assigned_date_val, due_date_val, min_level, ref_image_val))
+                        else:
+                            # Insert as a new task
+                            cursor.execute("""
+                                INSERT INTO tasks (user_id, sprite_type, variant, pokedex_identifier, status, assigned_date, due_date, min_level, reference_image_url)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (user_id, sprite_type, variant, identifier, status_val, assigned_date_val, due_date_val, min_level, ref_image_val))
+                        
+                        imported_tasks_count += 1
+                
+                conn.commit()
+
             # Immediately update the last_db_mtime so the watcher doesn't catch it when we reset the ignore flag
             try:
                 self.last_db_mtime = os.path.getmtime(self.db_path)
             except Exception:
                 pass
 
-            return True, f"Successfully updated/inserted {updated_count} profiles from Google Sheets!"
+            msg = f"Successfully updated/inserted {updated_profiles_count} profiles and {imported_tasks_count} tasks from Google Sheets!"
+            if skipped_tasks_count > 0:
+                msg += f" (Skipped {skipped_tasks_count} invalid rows)"
+            return True, msg
         except Exception as e:
             return False, str(e)
         finally:
