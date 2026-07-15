@@ -727,6 +727,154 @@ class SheetSync(commands.Cog):
         
         self.pending_sync_task = asyncio.create_task(_delayed_sync())
 
+    async def perform_ref_image_sync(self, status_callback) -> str:
+        try:
+            # 1. Fetch all tasks with Discord attachment reference image URLs
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT task_id, variant, sprite_type, pokedex_identifier, reference_image_url
+                    FROM tasks
+                    WHERE reference_image_url LIKE 'https://media.discordapp.net/attachments/%'
+                       OR reference_image_url LIKE 'https://cdn.discordapp.com/attachments/%'
+                """)
+                tasks_to_sync = cursor.fetchall()
+            
+            if not tasks_to_sync:
+                return "✅ No Discord reference images found that need syncing to Google Drive."
+
+            await status_callback(f"⏳ Found **{len(tasks_to_sync)}** Discord reference images. Starting upload to Google Drive...")
+
+            # 2. Authenticate Google Drive API
+            credentials, auth_type = get_google_credentials()
+            if credentials is None:
+                return "❌ Failed to authenticate Google Drive: missing credentials."
+
+            from googleapiclient.discovery import build
+            from googleapiclient.http import MediaIoBaseUpload
+            import io
+            import aiohttp
+
+            drive_service = build('drive', 'v3', credentials=credentials)
+
+            # 3. Find or create the CoreletBot Ref Images folder
+            query = "name = 'CoreletBot Ref Images' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+            results = drive_service.files().list(q=query, spaces='drive', fields='files(id)').execute()
+            files = results.get('files', [])
+            if files:
+                folder_id = files[0]['id']
+            else:
+                folder_metadata = {
+                    'name': 'CoreletBot Ref Images',
+                    'mimeType': 'application/vnd.google-apps.folder'
+                }
+                folder = drive_service.files().create(body=folder_metadata, fields='id').execute()
+                folder_id = folder.get('id')
+                
+                # Make folder public reader
+                permission = {
+                    'type': 'anyone',
+                    'role': 'reader',
+                }
+                drive_service.permissions().create(fileId=folder_id, body=permission).execute()
+
+            # 4. Upload each image
+            uploaded_count = 0
+            failed_count = 0
+            
+            async with aiohttp.ClientSession() as session:
+                for task_id, variant, sprite_type, pokedex_identifier, discord_url in tasks_to_sync:
+                    try:
+                        # Download image from Discord
+                        async with session.get(discord_url) as resp:
+                            if resp.status != 200:
+                                failed_count += 1
+                                continue
+                            image_bytes = await resp.read()
+
+                        # Upload to Google Drive
+                        ext = "png"
+                        if ".jpg" in discord_url.lower() or ".jpeg" in discord_url.lower():
+                            ext = "jpg"
+                        elif ".gif" in discord_url.lower():
+                            ext = "gif"
+                        elif ".webp" in discord_url.lower():
+                            ext = "webp"
+
+                        file_name = f"task_{task_id}_{pokedex_identifier}_{sprite_type}.{ext}".replace(" ", "_")
+                        file_metadata = {
+                            'name': file_name,
+                            'parents': [folder_id]
+                        }
+                        
+                        media = MediaIoBaseUpload(io.BytesIO(image_bytes), mimetype=f'image/{ext}', resumable=True)
+                        drive_file = drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+                        drive_file_id = drive_file.get('id')
+                        
+                        # Generate direct link for Google Sheets
+                        gdrive_url = f"https://docs.google.com/uc?export=download&id={drive_file_id}"
+                        
+                        # Update in the database
+                        with sqlite3.connect(self.db_path) as conn:
+                            cursor = conn.cursor()
+                            cursor.execute("""
+                                UPDATE tasks
+                                SET reference_image_url = ?
+                                WHERE task_id = ?
+                            """, (gdrive_url, task_id))
+                            conn.commit()
+
+                        uploaded_count += 1
+                    except Exception as e:
+                        print(f"Failed to sync task {task_id} image to Drive: {e}")
+                        failed_count += 1
+
+            # 5. Sync to Sheets
+            sync_msg = ""
+            if uploaded_count > 0:
+                success, msg = await self.perform_sync()
+                if success:
+                    sync_msg = "\n✅ Successfully synced updated image links to Google Sheets!"
+                else:
+                    sync_msg = f"\n⚠️ Failed to sync Sheets after uploads: {msg}"
+
+            return f"📊 **Google Drive Sync Report:**\n" \
+                   f"• Successfully uploaded: **{uploaded_count}** images\n" \
+                   f"• Failed: **{failed_count}** images" \
+                   f"{sync_msg}"
+
+        except Exception as e:
+            return f"❌ An error occurred: {e}"
+
+    @app_commands.command(name="syncrefimages", description="Sync and upload Discord reference images to Google Drive and update Sheets")
+    @app_commands.checks.has_role("Directors 🌇")
+    async def syncrefimages(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        
+        async def status_callback(text):
+            await interaction.followup.send(text, ephemeral=True)
+
+        report = await self.perform_ref_image_sync(status_callback)
+        await interaction.followup.send(report, ephemeral=True)
+
+    @commands.command(name="syncrefimages", aliases=["syncimages", "uploadimages"])
+    async def prefix_syncrefimages(self, ctx: commands.Context):
+        is_director = False
+        if isinstance(ctx.author, discord.Member):
+            is_director = any(role.name == "Directors 🌇" for role in ctx.author.roles)
+        
+        if not is_director:
+            await ctx.reply("❌ You do not have the required role to run this command.")
+            return
+
+        msg = await ctx.reply("⏳ Scanning for Discord reference images to upload to Google Drive...")
+        
+        async def status_callback(text):
+            await msg.edit(content=text)
+
+        report = await self.perform_ref_image_sync(status_callback)
+        await ctx.reply(report)
+
     def cog_unload(self):
         self.auto_sync.cancel()
         self.db_file_watcher.cancel()
