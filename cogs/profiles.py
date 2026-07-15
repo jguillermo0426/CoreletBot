@@ -180,6 +180,59 @@ class Profiles(commands.Cog):
 
         await interaction.response.send_message(embed=embed)
 
+    @app_commands.command(name="updatelevel", description="Update a member's Void Dev level")
+    @app_commands.describe(
+        user="The Discord member whose level you want to update",
+        level="The new level to set (e.g., 2, 3)"
+    )
+    async def updatelevel(
+        self,
+        interaction: discord.Interaction,
+        user: discord.Member,
+        level: int
+    ):
+        if not has_director_role(interaction.user):
+            await interaction.response.send_message(
+                "❌ Only Directors can update member levels.",
+                ephemeral=True
+            )
+            return
+
+        if level < 1:
+            await interaction.response.send_message(
+                "❌ Level must be a positive integer greater than or equal to 1.",
+                ephemeral=True
+            )
+            return
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT level FROM users WHERE user_id = ?", (user.id,))
+                row = cursor.fetchone()
+                
+                if not row:
+                    # User not in database; insert them with the new level
+                    cursor.execute("""
+                        INSERT INTO users (user_id, discord_name, level)
+                        VALUES (?, ?, ?)
+                    """, (user.id, user.display_name, level))
+                else:
+                    cursor.execute("""
+                        UPDATE users
+                        SET level = ?
+                        WHERE user_id = ?
+                    """, (level, user.id))
+                
+                conn.commit()
+
+            await interaction.response.send_message(
+                f"✅ Successfully updated {user.mention}'s level to **{level}**."
+            )
+
+        except Exception as e:
+            await interaction.response.send_message(f"An error occurred: {e}", ephemeral=True)
+
     @app_commands.command(name="whosworking", description="View a summary of all members who are currently working on tasks")
     async def whosworking(self, interaction: discord.Interaction):
         try:
