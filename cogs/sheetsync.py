@@ -119,6 +119,7 @@ class SheetSync(commands.Cog):
         self.db_path = "data/corelet.db"
         self.last_db_mtime = None
         self.pending_sync_task = None
+        self._ignore_watcher = False
         
         # --- Google Sheets Authentication ---
         try:
@@ -494,6 +495,7 @@ class SheetSync(commands.Cog):
         if self.gc is None:
             return False, "Google Sheets API is not connected."
 
+        self._ignore_watcher = True
         try:
             records = self.profiles_sheet.get_all_records()
 
@@ -505,24 +507,48 @@ class SheetSync(commands.Cog):
                     if not user_id_str.isdigit():
                         continue
 
-                    # Update the database with the values from the sheet
+                    try:
+                        level = int(row.get("Level"))
+                    except (ValueError, TypeError):
+                        level = 1
+
+                    try:
+                        tasks_completed = int(row.get("Tasks Completed"))
+                    except (ValueError, TypeError):
+                        tasks_completed = 0
+
+                    # Insert or update the user in the database
                     cursor.execute("""
-                        UPDATE users
-                        SET discord_name = ?, pronouns = ?, timezone = ?, level = ?, tasks_completed = ?
-                        WHERE user_id = ?
+                        INSERT INTO users (user_id, discord_name, pronouns, timezone, level, tasks_completed)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(user_id) DO UPDATE SET
+                            discord_name = excluded.discord_name,
+                            pronouns = excluded.pronouns,
+                            timezone = excluded.timezone,
+                            level = excluded.level,
+                            tasks_completed = excluded.tasks_completed
                     """, (
+                        int(user_id_str),
                         row.get("Discord Name"),
                         row.get("Pronouns"),
                         row.get("Timezone"),
-                        row.get("Level"),
-                        row.get("Tasks Completed"),
-                        int(user_id_str)
+                        level,
+                        tasks_completed
                     ))
                     updated_count += cursor.rowcount
                 conn.commit()
-            return True, f"Successfully updated {updated_count} profiles from Google Sheets!"
+            
+            # Immediately update the last_db_mtime so the watcher doesn't catch it when we reset the ignore flag
+            try:
+                self.last_db_mtime = os.path.getmtime(self.db_path)
+            except Exception:
+                pass
+
+            return True, f"Successfully updated/inserted {updated_count} profiles from Google Sheets!"
         except Exception as e:
             return False, str(e)
+        finally:
+            self._ignore_watcher = False
 
     # --- Automatic Background Loop ---
     @tasks.loop(hours=12)
@@ -544,6 +570,14 @@ class SheetSync(commands.Cog):
         if not os.path.exists(self.db_path):
             return
         
+        if getattr(self, "_ignore_watcher", False):
+            # If we are manually importing, update last_db_mtime so we don't trigger next run either
+            try:
+                self.last_db_mtime = os.path.getmtime(self.db_path)
+            except Exception:
+                pass
+            return
+
         try:
             mtime = os.path.getmtime(self.db_path)
         except Exception:
