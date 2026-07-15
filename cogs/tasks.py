@@ -3875,6 +3875,273 @@ class Tasks(commands.Cog):
         except Exception as e:
             await interaction.followup.send(f"Database error: {e}", ephemeral=True)
 
+    @app_commands.command(name="mapthread", description="Map the current thread/channel to a task or task bundle")
+    @app_commands.describe(
+        task_id="Optional: The ID of a specific task to link. If provided, maps this task (and its bundle).",
+        pokedex_identifier="Optional: The name or Dex number of the Pokemon/Character/Sound.",
+        variant="Optional: The variant (Base, Shiny, Anomaly, Character, Audio).",
+        sprite_type="Optional: Specific sprite/task type (Front, Back, Icon, Music, Design, etc.).",
+        map_entire_bundle="If True, maps all related tasks for this Pokemon/Character/Sound. Default is True."
+    )
+    async def mapthread(
+        self,
+        interaction: discord.Interaction,
+        task_id: Optional[int] = None,
+        pokedex_identifier: Optional[str] = None,
+        variant: Optional[str] = None,
+        sprite_type: Optional[str] = None,
+        map_entire_bundle: bool = True
+    ):
+        if not await self.require_director(interaction):
+            return
+
+        if task_id is None and pokedex_identifier is None:
+            await interaction.response.send_message(
+                "❌ You must provide either a `task_id` or a `pokedex_identifier` to identify the tasks to map.",
+                ephemeral=True
+            )
+            return
+
+        thread_id = interaction.channel.id
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+
+                # Helper to find which where clause to use for the bundle
+                def get_bundle_where_clause(v: str):
+                    if v == 'Character':
+                        return "variant = 'Character'"
+                    elif v == 'Audio':
+                        return "variant = 'Audio'"
+                    else:
+                        return "variant IN ('Base', 'Shiny', 'Anomaly')"
+
+                # If task_id is provided, look up the task first
+                if task_id is not None:
+                    cursor.execute("""
+                        SELECT variant, sprite_type, pokedex_identifier
+                        FROM tasks WHERE task_id = ?
+                    """, (task_id,))
+                    row = cursor.fetchone()
+                    if not row:
+                        await interaction.followup.send(f"❌ Task with ID **#{task_id}** not found.", ephemeral=True)
+                        return
+                    
+                    t_variant, t_sprite_type, t_identifier = row
+                    
+                    if map_entire_bundle:
+                        where_clause = get_bundle_where_clause(t_variant)
+                        cursor.execute(f"""
+                            UPDATE tasks
+                            SET forum_thread_id = ?
+                            WHERE pokedex_identifier = ? AND {where_clause}
+                        """, (thread_id, t_identifier))
+                        updated_count = cursor.rowcount
+                        msg = f"✅ Mapped all **{updated_count}** tasks in the bundle for **{t_identifier}** ({t_variant}) to this thread."
+                    else:
+                        cursor.execute("""
+                            UPDATE tasks
+                            SET forum_thread_id = ?
+                            WHERE task_id = ?
+                        """, (thread_id, task_id))
+                        msg = f"✅ Mapped task **#{task_id}** ({t_variant} {t_sprite_type} — {t_identifier}) to this thread."
+                
+                # If pokedex_identifier is provided instead
+                else:
+                    target_identifier = pokedex_identifier.strip()
+                    
+                    # Construct query filters
+                    filters = ["pokedex_identifier = ?"]
+                    params = [target_identifier]
+                    
+                    if variant is not None:
+                        filters.append("variant = ?")
+                        params.append(variant.strip())
+                    
+                    if sprite_type is not None:
+                        filters.append("sprite_type = ?")
+                        params.append(sprite_type.strip())
+
+                    # If mapping entire bundle and variant is not explicitly set, we find what variant exists first
+                    if map_entire_bundle and variant is None:
+                        cursor.execute("""
+                            SELECT DISTINCT variant FROM tasks WHERE pokedex_identifier = ?
+                        """, (target_identifier,))
+                        var_rows = cursor.fetchall()
+                        if not var_rows:
+                            await interaction.followup.send(f"❌ No tasks found matching identifier **{target_identifier}**.", ephemeral=True)
+                            return
+                        
+                        # Map all matching rows for this identifier
+                        cursor.execute(f"""
+                            UPDATE tasks
+                            SET forum_thread_id = ?
+                            WHERE pokedex_identifier = ?
+                        """, (thread_id, target_identifier))
+                        updated_count = cursor.rowcount
+                        msg = f"✅ Mapped all **{updated_count}** tasks for **{target_identifier}** to this thread."
+                    elif map_entire_bundle and variant is not None:
+                        where_clause = get_bundle_where_clause(variant.strip())
+                        cursor.execute(f"""
+                            UPDATE tasks
+                            SET forum_thread_id = ?
+                            WHERE pokedex_identifier = ? AND {where_clause}
+                        """, (thread_id, target_identifier))
+                        updated_count = cursor.rowcount
+                        msg = f"✅ Mapped all **{updated_count}** tasks in the bundle for **{target_identifier}** ({variant}) to this thread."
+                    else:
+                        # Map specific subset
+                        where_str = " AND ".join(filters)
+                        cursor.execute(f"""
+                            UPDATE tasks
+                            SET forum_thread_id = ?
+                            WHERE {where_str}
+                        """, (thread_id, *params))
+                        updated_count = cursor.rowcount
+                        if updated_count == 0:
+                            await interaction.followup.send("❌ No tasks found matching the criteria.", ephemeral=True)
+                            return
+                        msg = f"✅ Mapped **{updated_count}** matching tasks for **{target_identifier}** to this thread."
+
+                conn.commit()
+
+            # Update the task forum summary post if we are in a thread
+            if isinstance(interaction.channel, discord.Thread):
+                await update_task_forum_summary(self.bot, self.db_path, thread_id)
+
+            await interaction.followup.send(msg, ephemeral=True)
+
+        except discord.Forbidden as e:
+            await interaction.followup.send(discord_access_error_message(e), ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"Database error: {e}", ephemeral=True)
+
+    @app_commands.command(name="automapthreads", description="Automatically map all existing forum threads to their tasks in the database")
+    async def automapthreads(self, interaction: discord.Interaction):
+        if not await self.require_director(interaction):
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        # 1. Collect all forum channel IDs from environment variables
+        forum_env_keys = [
+            "POKEMON_TASK_FORUM_CHANNEL_ID",
+            "CHARACTER_TASK_FORUM_CHANNEL_ID",
+            "MUSIC_TASK_FORUM_CHANNEL_ID",
+            "SOUNDS_TASK_FORUM_CHANNEL_ID",
+            "SFX_TASK_FORUM_CHANNEL_ID",
+            "CRIES_TASK_FORUM_CHANNEL_ID",
+            "TASK_FORUM_CHANNEL_ID"
+        ]
+        
+        forum_channel_ids = []
+        for key in forum_env_keys:
+            val = os.getenv(key)
+            if val and val.isdigit():
+                forum_channel_ids.append(int(val))
+        
+        # Unique and non-zero
+        forum_channel_ids = sorted(list(set(forum_channel_ids)))
+
+        if not forum_channel_ids:
+            await interaction.followup.send(
+                "❌ No forum channel IDs are configured in environment variables (e.g. POKEMON_TASK_FORUM_CHANNEL_ID).",
+                ephemeral=True
+            )
+            return
+
+        # 2. Helper to determine variant filters based on the parent forum channel ID
+        def get_variants_for_forum_id(channel_id: int):
+            pokemon_id = os.getenv("POKEMON_TASK_FORUM_CHANNEL_ID")
+            char_id = os.getenv("CHARACTER_TASK_FORUM_CHANNEL_ID")
+            
+            music_id = os.getenv("MUSIC_TASK_FORUM_CHANNEL_ID")
+            sounds_id = os.getenv("SOUNDS_TASK_FORUM_CHANNEL_ID")
+            sfx_id = os.getenv("SFX_TASK_FORUM_CHANNEL_ID")
+            cries_id = os.getenv("CRIES_TASK_FORUM_CHANNEL_ID")
+            
+            sound_ids = {int(x) for x in (music_id, sounds_id, sfx_id, cries_id) if x and x.isdigit()}
+            
+            if pokemon_id and pokemon_id.isdigit() and int(pokemon_id) == channel_id:
+                return ("Base", "Shiny", "Anomaly")
+            elif char_id and char_id.isdigit() and int(char_id) == channel_id:
+                return ("Character",)
+            elif channel_id in sound_ids:
+                return ("Audio",)
+            else:
+                return ("Base", "Shiny", "Anomaly", "Character", "Audio")
+
+        threads_processed = 0
+        tasks_mapped = 0
+        errors = []
+
+        try:
+            # Connect to DB and fetch tasks
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+
+                for cid in forum_channel_ids:
+                    try:
+                        channel = self.bot.get_channel(cid) or await self.bot.fetch_channel(cid)
+                    except Exception as e:
+                        errors.append(f"Could not fetch channel ID {cid}: {e}")
+                        continue
+                    
+                    if not isinstance(channel, discord.ForumChannel):
+                        continue
+
+                    # Fetch active threads
+                    try:
+                        active_threads_payload = await channel.fetch_active_threads()
+                        threads = list(active_threads_payload.threads)
+                    except Exception as e:
+                        errors.append(f"Error fetching active threads for {channel.name}: {e}")
+                        threads = []
+
+                    # Fetch archived threads
+                    try:
+                        async for thread in channel.archived_threads(limit=None):
+                            threads.append(thread)
+                    except Exception as e:
+                        errors.append(f"Error fetching archived threads for {channel.name}: {e}")
+
+                    # Process all threads
+                    for thread in threads:
+                        threads_processed += 1
+                        thread_name = thread.name.strip()
+                        variants = get_variants_for_forum_id(cid)
+                        placeholders = ", ".join("?" for _ in variants)
+
+                        # Update tasks where the pokedex_identifier matches the thread name
+                        cursor.execute(f"""
+                            UPDATE tasks
+                            SET forum_thread_id = ?
+                            WHERE LOWER(pokedex_identifier) = LOWER(?)
+                              AND variant IN ({placeholders})
+                        """, (thread.id, thread_name, *variants))
+                        
+                        tasks_mapped += cursor.rowcount
+                
+                conn.commit()
+
+            msg = f"⚙️ **Auto-Mapping Complete!**\n" \
+                  f"• Forum channels checked: **{len(forum_channel_ids)}**\n" \
+                  f"• Forum threads parsed: **{threads_processed}**\n" \
+                  f"• Tasks mapped/updated: **{tasks_mapped}**"
+            
+            if errors:
+                msg += "\n\n⚠️ **Warnings/Errors encountered during sync:**\n" + "\n".join(f"- {err}" for err in errors[:5])
+                if len(errors) > 5:
+                    msg += f"\n*...and {len(errors) - 5} more warnings.*"
+
+            await interaction.followup.send(msg, ephemeral=True)
+
+        except Exception as e:
+            await interaction.followup.send(f"❌ An error occurred during automap: {e}", ephemeral=True)
+
     async def removeavailabletask(self, interaction: discord.Interaction, identifier: str, sprite_type: str, variant: str):
         task = self.fetch_query("""
             SELECT task_id, forum_thread_id FROM tasks
