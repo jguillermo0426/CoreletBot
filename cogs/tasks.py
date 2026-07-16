@@ -219,7 +219,28 @@ def normalize_task_search_args(scope: Optional[str], category: Optional[str]):
 
 
 def normalize_assignment_slot_label(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
+    val = re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
+    # remove plural 's' at the end of words like sprites -> sprite
+    val = re.sub(r"\bsprites\b", "sprite", val)
+    
+    mapping = {
+        "front": "base front",
+        "front sprite": "base front",
+        "base front sprite": "base front",
+        "front 2": "base front 2",
+        "front 2 sprite": "base front 2",
+        "base front 2 sprite": "base front 2",
+        "frame 2": "base front 2",
+        "base frame 2": "base front 2",
+        "back": "base back",
+        "back sprite": "base back",
+        "base back sprite": "base back",
+        "icon": "base icon",
+        "icon sprite": "base icon",
+        "base icon sprite": "base icon",
+    }
+    return mapping.get(val, val)
+
 
 
 def split_assignment_mapping_line(line: str):
@@ -534,33 +555,52 @@ def build_board_task_lines(category_key: str, task_rows):
 
 def parse_pokemon_sprite_alias(value: str):
     clean_value = re.sub(r"[\s_-]+", "", value.strip().casefold())
+    # remove trailing 's' if it ends with sprites
+    if clean_value.endswith("sprites"):
+        clean_value = clean_value[:-1]
+
     aliases = {
         "f": ("Base", "Front"),
         "front": ("Base", "Front"),
+        "frontsprite": ("Base", "Front"),
         "basefront": ("Base", "Front"),
+        "basefrontsprite": ("Base", "Front"),
         "f2": ("Base", "Front 2"),
         "front2": ("Base", "Front 2"),
+        "front2sprite": ("Base", "Front 2"),
         "basefront2": ("Base", "Front 2"),
+        "basefront2sprite": ("Base", "Front 2"),
         "b": ("Base", "Back"),
         "back": ("Base", "Back"),
+        "backsprite": ("Base", "Back"),
         "baseback": ("Base", "Back"),
+        "basebacksprite": ("Base", "Back"),
         "sf": ("Shiny", "Front"),
         "shinyfront": ("Shiny", "Front"),
+        "shinyfrontsprite": ("Shiny", "Front"),
         "sf2": ("Shiny", "Front 2"),
         "shinyfront2": ("Shiny", "Front 2"),
+        "shinyfront2sprite": ("Shiny", "Front 2"),
         "sb": ("Shiny", "Back"),
         "shinyback": ("Shiny", "Back"),
+        "shinybacksprite": ("Shiny", "Back"),
         "af": ("Anomaly", "Front"),
         "anomalyfront": ("Anomaly", "Front"),
+        "anomalyfrontsprite": ("Anomaly", "Front"),
         "af2": ("Anomaly", "Front 2"),
         "anomalyfront2": ("Anomaly", "Front 2"),
+        "anomalyfront2sprite": ("Anomaly", "Front 2"),
         "ab": ("Anomaly", "Back"),
         "anomalyback": ("Anomaly", "Back"),
+        "anomalybacksprite": ("Anomaly", "Back"),
         "i": ("Base", "Icon"),
         "icon": ("Base", "Icon"),
+        "iconsprite": ("Base", "Icon"),
         "baseicon": ("Base", "Icon"),
+        "baseiconsprite": ("Base", "Icon"),
     }
     return aliases.get(clean_value)
+
 
 
 def build_identifier_search(identifier: Optional[str]):

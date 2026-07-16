@@ -85,21 +85,36 @@ CHARACTER_ARTIST_COLUMNS = {
 
 SUBMISSION_SLOT_ALIASES = {
     "base front": ("Base", "Front"),
+    "front": ("Base", "Front"),
+    "front sprite": ("Base", "Front"),
+    "base front sprite": ("Base", "Front"),
     "base front 2": ("Base", "Front 2"),
     "base frame 2": ("Base", "Front 2"),
     "frame 2": ("Base", "Front 2"),
     "front 2": ("Base", "Front 2"),
+    "front 2 sprite": ("Base", "Front 2"),
+    "base front 2 sprite": ("Base", "Front 2"),
     "base back": ("Base", "Back"),
+    "back": ("Base", "Back"),
+    "back sprite": ("Base", "Back"),
+    "base back sprite": ("Base", "Back"),
     "base icon": ("Base", "Icon"),
     "icon": ("Base", "Icon"),
+    "icon sprite": ("Base", "Icon"),
     "shiny front": ("Shiny", "Front"),
+    "shiny front sprite": ("Shiny", "Front"),
     "shiny front 2": ("Shiny", "Front 2"),
+    "shiny front 2 sprite": ("Shiny", "Front 2"),
     "shiny frame 2": ("Shiny", "Front 2"),
     "shiny back": ("Shiny", "Back"),
+    "shiny back sprite": ("Shiny", "Back"),
     "anomaly front": ("Anomaly", "Front"),
+    "anomaly front sprite": ("Anomaly", "Front"),
     "anomaly front 2": ("Anomaly", "Front 2"),
+    "anomaly front 2 sprite": ("Anomaly", "Front 2"),
     "anomaly frame 2": ("Anomaly", "Front 2"),
     "anomaly back": ("Anomaly", "Back"),
+    "anomaly back sprite": ("Anomaly", "Back"),
     "character design": ("Character", "Design"),
     "design": ("Character", "Design"),
     "character battler": ("Character", "Battler"),
@@ -123,7 +138,9 @@ def sheet_text(value):
 
 
 def normalize_submission_label(value: str):
-    return re.sub(r"[^a-z0-9]+", " ", (value or "").casefold()).strip()
+    val = re.sub(r"[^a-z0-9]+", " ", (value or "").casefold()).strip()
+    val = re.sub(r"\bsprites\b", "sprite", val)
+    return val
 
 
 def parse_submission_slot_label(value: str):
