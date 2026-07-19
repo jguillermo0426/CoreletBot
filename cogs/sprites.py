@@ -686,11 +686,16 @@ class Sprites(commands.Cog):
             await interaction.followup.send(f"❌ Failed to update Google Sheets: {e}")
             return
 
-        try:
             self.execute_query(
                 "UPDATE tasks SET status = 'Completed', completion_message_url = ? WHERE task_id = ?",
                 (message.jump_url, task_id),
             )
+            self.execute_query("""
+                INSERT INTO users (user_id, discord_name)
+                VALUES (?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    discord_name = COALESCE(users.discord_name, excluded.discord_name)
+            """, (user_id, artist_name))
             self.execute_query("UPDATE users SET tasks_completed = tasks_completed + 1 WHERE user_id = ?", (user_id,))
             await update_task_bundle_forum_status(
                 self.bot,

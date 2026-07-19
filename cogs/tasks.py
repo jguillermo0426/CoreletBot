@@ -2607,11 +2607,13 @@ class Tasks(commands.Cog):
 
     def adjust_user_task_total(self, cursor, user_id: int, delta: int, discord_name: str):
         self.ensure_user_record(cursor, user_id, discord_name)
-        cursor.execute("SELECT tasks_completed FROM users WHERE user_id = ?", (user_id,))
+        cursor.execute("SELECT tasks_completed, level FROM users WHERE user_id = ?", (user_id,))
         row = cursor.fetchone()
         current_completed = int(row[0] or 0) if row else 0
+        current_level = int(row[1] or 1) if (row and len(row) > 1 and row[1]) else 1
         new_completed = max(0, current_completed + delta)
-        new_level = (new_completed // self.tasks_per_level) + 1
+        natural_level = (new_completed // self.tasks_per_level) + 1
+        new_level = max(current_level, natural_level)
         cursor.execute(
             "UPDATE users SET tasks_completed = ?, level = ? WHERE user_id = ?",
             (new_completed, new_level, user_id),
