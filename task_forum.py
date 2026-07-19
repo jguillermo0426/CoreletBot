@@ -175,8 +175,6 @@ def build_task_forum_summary(thread_name: str, rows):
     return (
         f"**Task:** {thread_name}\n"
         f"**Status:** {aggregate_status}\n\n"
-        + (f"**Reference:** {', '.join(reference_image_urls)}\n\n" if reference_image_urls else "")
-        +
         "**Task Breakdown**\n"
         + "\n".join(lines)
     )
@@ -243,8 +241,6 @@ async def create_task_forum_post(
         content=(
             f"**Task:** {task_title}\n"
             "**Status:** Missing\n\n"
-            + (f"**Reference:** {reference_image_url}\n\n" if reference_image_url else "")
-            +
             "This task is available to claim from the task board."
         ),
         applied_tags=applied_tags,

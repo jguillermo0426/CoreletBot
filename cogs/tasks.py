@@ -4423,8 +4423,14 @@ class Tasks(commands.Cog):
         print("Running daily deadline check...")
         now = datetime.now(timezone.utc)
         
-        # Fetch all tasks that are still "Assigned"
-        active_tasks = self.fetch_query("SELECT task_id, user_id, assigned_date, due_date, forum_thread_id FROM tasks WHERE status = 'Assigned'")
+        # Fetch all tasks that are still "Assigned" and have no feedback/completion links
+        active_tasks = self.fetch_query("""
+            SELECT task_id, user_id, assigned_date, due_date, forum_thread_id
+            FROM tasks
+            WHERE status = 'Assigned'
+              AND feedback_message_url IS NULL
+              AND completion_message_url IS NULL
+        """)
 
         for task in active_tasks:
             task_id, user_id, assigned_date_str, due_date_str, thread_id = task

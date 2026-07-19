@@ -686,6 +686,7 @@ class Sprites(commands.Cog):
             await interaction.followup.send(f"❌ Failed to update Google Sheets: {e}")
             return
 
+        try:
             self.execute_query(
                 "UPDATE tasks SET status = 'Completed', completion_message_url = ? WHERE task_id = ?",
                 (message.jump_url, task_id),
